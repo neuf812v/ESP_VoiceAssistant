@@ -9,14 +9,14 @@ extern "C" {
 #endif
 
 /**
- * Speak text via Gemini TTS API.
+ * Speak text via Google Cloud Text-to-Speech API.
  *
- * Sends text to gemini-3.1-flash-tts-preview, streams the 24 kHz PCM
- * response directly to the I2S speaker (no large RAM buffer needed).
+ * Sends text to Cloud TTS (uk-UA-Wavenet-A), receives LINEAR16 PCM 24 kHz,
+ * streams directly to I2S speaker via ring buffer.
  *
  * The speaker must be initialised at 24 kHz before calling this function.
  *
- * @param text       UTF-8 text to speak (plain text, no JSON escaping needed)
+ * @param text       UTF-8 text to speak
  * @param tx_handle  I2S TX channel handle (speaker at 24 kHz)
  * @return ESP_OK on success
  */

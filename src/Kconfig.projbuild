@@ -20,6 +20,12 @@ menu "Voice Assistant Configuration"
             default ""
             help
                 Google Gemini API key for LLM queries.
+
+        config CLOUD_TTS_API_KEY
+            string "Google Cloud TTS API Key"
+            default ""
+            help
+                Google Cloud Text-to-Speech API key (from Cloud Console).
     endmenu
 
     choice TEST_MODE_SELECT

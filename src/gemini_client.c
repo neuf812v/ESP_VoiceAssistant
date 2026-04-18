@@ -23,6 +23,11 @@ static const char *PROMPT_TEMPLATE =
     "Поточний час: %s. Місто: %s, %s. "
     "Погода зараз: %s. "
     "Не вигадуй факти. "
+    "ВАЖЛИВО: Всі числа пиши СЛОВАМИ з правильними відмінками "
+    "(наприклад: 'двадцять один градус', 'п'ять градусів', "
+    "'о сьомій тридцять', 'дванадцята година'). "
+    "Став наголоси (символ \\u0301) на словах де наголос може бути неочевидним "
+    "(Бе\\u0301регове, а НЕ Берегове\\u0301). "
     "Формат:\\nQ: <транскрипція>\\nA: <повна відповідь українською>";
 
 /* city/country/weather from main.c */
@@ -111,12 +116,12 @@ esp_err_t gemini_ask(const int16_t *pcm_data, size_t num_samples,
         localtime_r(&now, &ti);
         strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M, %A", &ti);
     }
-    char prompt[768];
+    char prompt[1280];
     snprintf(prompt, sizeof(prompt), PROMPT_TEMPLATE,
              time_str, g_city, g_country,
              g_weather[0] ? g_weather : "невідомо");
 
-    char json_suf[1024];
+    char json_suf[1536];
     snprintf(json_suf, sizeof(json_suf),
              "\"}},{\"text\":\"%s\"}]}],"
              "\"generationConfig\":{\"maxOutputTokens\":8192,"

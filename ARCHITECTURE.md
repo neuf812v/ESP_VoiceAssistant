@@ -7,14 +7,14 @@
 ```
 [INMP441 Mic] → I2S RX → PCM 16kHz/16bit → base64 WAV
     → HTTPS POST → Gemini 2.5 Flash (аудіо → текст)
-    → текст відповіді → HTTPS POST → Gemini 3.1 Flash TTS
+    → текст відповіді → HTTPS POST → Google Cloud TTS
     → base64 PCM 24kHz → ring buffer → I2S TX → [MAX98357A Speaker]
 ```
 
 ## Чому Gemini?
 
 **Gemini 2.5 Flash** — приймає аудіо напряму (multimodal), не потрібен окремий STT.
-**Gemini 3.1 Flash TTS Preview** — генерує мовлення з тексту, підтримує українську.
+**Google Cloud TTS** — генерує мовлення з тексту, нативний голос uk-UA-Wavenet-A, TTFB ~0.3-0.4с.
 
 | Критерій | Gemini | OpenAI GPT-4o | Whisper + LLM + TTS |
 |----------|--------|---------------|----------------------|
@@ -43,7 +43,7 @@
 │       │                                    │              │
 │  ┌────▼──────────┐              ┌─────────▼───────────┐  │
 │  │ gemini_client │              │    tts_client        │  │
-│  │ Gemini 2.5    │              │  Gemini 3.1 TTS      │  │
+│  │ Gemini 2.5    │              │  Cloud TTS           │  │
 │  │ (аудіо→текст) │              │  (текст→мовлення)    │  │
 │  └───────────────┘              │                      │  │
 │                                 │  ┌────────────────┐  │  │
@@ -67,7 +67,7 @@
 | **i2s_speaker** | `i2s_speaker.h/.c` | ✅ | MAX98357A, I2S1 TX, 16/24 kHz, DMA 8×480 |
 | **wifi_manager** | `wifi_manager.h/.c` | ✅ | WiFi STA, max 10 retries, auto-reconnect |
 | **gemini_client** | `gemini_client.h/.c` | ✅ | Стрімінг base64 WAV, thinking budget 256, maxOutputTokens 8192 |
-| **tts_client** | `tts_client.h/.c` | ✅ | Ring buffer (12KB), producer/consumer, fade-in, SSE streaming |
+| **tts_client** | `tts_client.h/.c` | ✅ | Google Cloud TTS, uk-UA-Wavenet-A, ring buffer 12KB, producer/consumer, fade-in |
 | **main** | `main.c` | ✅ | 7 тестових режимів + assistant pipeline, NTP, геолокація, погода |
 
 ## Data Flow (потік даних)
@@ -105,20 +105,22 @@ PCM буфер → стрімінг base64 WAV (768-byte чанки) → HTTP PO
 - thinkingBudget: 256 (всередині generationConfig)
 - maxOutputTokens: 8192 (повні відповіді без обмеження довжини)
 - **Динамічний промпт**: Q/A формат, українською, включає поточний час, місто, країну, погоду
+- Числа словами з правильними відмінками, наголоси на неоднозначних словах
 - Парсинг: знаходить останній `text` (пропускає thinking)
 
 ### 4. Text-to-Speech (tts_client)
 ```
-Текст "A:" частини → HTTP POST → Gemini 3.1 Flash TTS Preview
-    → стрімінг base64 → decode → PCM 24kHz/16bit → ring buffer
+Текст "A:" частини → HTTP POST → Google Cloud TTS (uk-UA-Wavenet-A)
+    → base64 WAV → skip 44-byte header → PCM 24kHz/16bit → ring buffer
     → consumer task → I2S TX → MAX98357A → динамік
 ```
 
-- Модель: `gemini-3.1-flash-tts-preview`
-- Ендпоінт: `streamGenerateContent?alt=sse` (SSE streaming)
-- Голос: Kore
+- API: Google Cloud Text-to-Speech (`texttospeech.googleapis.com/v1/text:synthesize`)
+- Аутентифікація: API key (Cloud Console)
+- Голос: `uk-UA-Wavenet-A` (нативна українська)
+- Формат: LINEAR16, 24 kHz, WAV з 44-byte заголовком (пропускається)
 - Ring buffer: 12KB (~250мс) — FreeRTOS StreamBuffer
-- Producer task (Core 0): HTTP read → base64 decode → ring buffer
+- Producer task (Core 0): HTTP read → base64 decode → skip WAV header → ring buffer
 - Consumer (Core 1): ring buffer → I2S write
 - Pre-fill: 6KB в ring buffer перед першим I2S write
 - Volume: 75% (запобігає brownout)
@@ -140,21 +142,19 @@ BOOT натиснуто → запис (до 3с) → BOOT відпущено
 
 | Етап | Час |
 |------|-----|
-| Gemini STT+LLM (текст) | ~5-6 сек |
-| TLS connect (TTS) | ~2.2 сек |
-| **TTS TTFB (серверний синтез)** | **~8-13 сек** |
-| Перший звук від відпускання кнопки | ~15-18 сек |
+| Gemini STT+LLM (текст) | ~4-5 сек |
+| TLS connect (Cloud TTS) | ~2.2 сек |
+| **Cloud TTS TTFB** | **~0.3-0.4 сек** |
+| Перший звук від відпускання кнопки | **~7-8 сек** |
 
-**Головне обмеження**: Gemini TTS синтезує весь аудіофайл цілком на сервері перед відправкою. Навіть з `streamGenerateContent` (SSE) аудіо приходить одним блоком. TTFB пропорційний довжині тексту:
-- Коротка відповідь (~1-2 речення): TTFB ~8 сек
-- Довга відповідь (~5-6 речень): TTFB ~13 сек
+**Cloud TTS vs Gemini TTS**: Перехід на Google Cloud TTS зменшив TTFB з ~10с до ~0.4с. Загальна латентність до першого звуку впала з ~15-18с до ~7-8с. Головне вузьке місце тепер — Gemini STT+LLM (~5с) і TLS handshake (~2.2с).
 
 ## Обмеження та рішення
 
 | Обмеження | Рішення |
 |-----------|---------|
 | RAM 320KB, без PSRAM | Стрімінг: base64 encode/decode чанками, ring buffer 12KB |
-| Flash 2MB (~97.6% зайнято) | Мінімум бібліотек, mbedtls cert bundle, ~25KB вільно |
+| Flash 4MB (custom partition, ~24.8% зайнято) | Кастомна таблиця розділів: ~3.9MB під додаток, без OTA |
 | Brownout при TTS + WiFi | Volume 75%, fade-in, мік вимикається під час TTS |
 | I2S DMA underrun | Ring buffer + producer/consumer на різних ядрах |
 | WiFi modem sleep latency | WiFi PS_NONE під час TTS |
@@ -166,8 +166,8 @@ BOOT натиснуто → запис (до 3с) → BOOT відпущено
 
 | Файл | В git | Зміст |
 |------|-------|-------|
-| `sdkconfig.defaults` | ✅ | Flash size, brownout, mbedtls |
-| `secrets.defaults` | ❌ | WiFi SSID/password, API key |
+| `sdkconfig.defaults` | ✅ | Flash size 4MB, custom partitions, brownout, mbedtls |
+| `secrets.defaults` | ❌ | WiFi SSID/password, Gemini API key, Cloud TTS API key |
 | `secrets.defaults.example` | ✅ | Шаблон для копіювання |
 | `Kconfig.projbuild` | ✅ | Menuconfig опції |
 
@@ -192,5 +192,5 @@ BOOT натиснуто → запис (до 3с) → BOOT відпущено
 6. ~~Кнопка PTT (BOOT / GPIO0)~~ ✅
 7. ~~Таймінг-логи~~ ✅
 8. ~~NTP + геолокація + погода в контексті Gemini~~ ✅
-9. LED індикатор стану
-10. Google Cloud TTS (швидший TTFB, потребує OAuth2)
+9. ~~Google Cloud TTS (uk-UA-Wavenet-A, TTFB ~0.4с)~~ ✅
+10. LED індикатор стану

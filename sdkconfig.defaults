@@ -1,4 +1,8 @@
-CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Custom partition table — ~3.9MB for app (no OTA)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # Lower brownout threshold from 2.44V to 2.27V for USB power stability
 CONFIG_ESP_BROWNOUT_DET_LVL_SEL_5=y

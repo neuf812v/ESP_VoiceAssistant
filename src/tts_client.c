@@ -16,10 +16,10 @@
 static const char *TAG = "tts";
 
 /* ---------- Configuration ---------- */
-#define TTS_MODEL     "gemini-3.1-flash-tts-preview"
-#define TTS_URL       "https://generativelanguage.googleapis.com/v1beta/models/" \
-                      TTS_MODEL ":streamGenerateContent?alt=sse&key="
-#define TTS_VOICE     "Kore"
+#define TTS_URL       "https://texttospeech.googleapis.com/v1/text:synthesize?key="
+#define TTS_VOICE     "uk-UA-Wavenet-A"
+#define TTS_LANG      "uk-UA"
+#define TTS_RATE      24000
 
 #define READ_BUF_SZ   4096
 #define B64_BUF_SZ    1024          /* must be multiple of 4 */
@@ -30,6 +30,7 @@ static const char *TAG = "tts";
 #define PREFILL_SZ    (6 * 1024)    /* start playback after ~125 ms buffered */
 #define PLAY_CHUNK    768           /* consumer I2S write chunk */
 #define PRODUCER_STACK 6144
+#define WAV_HEADER_SZ 44            /* WAV header to skip for LINEAR16 */
 
 /* ---------- JSON text escaping ---------- */
 static size_t json_escape(const char *src, char *dst, size_t dst_sz)
@@ -71,19 +72,20 @@ static void tts_producer_task(void *arg)
     char *read_buf = malloc(READ_BUF_SZ);
     if (!read_buf) { ctx->done = true; vTaskDelete(NULL); return; }
 
-    enum { FIND_DATA, STREAM_B64 } state = FIND_DATA;
+    /* State machine: find "audioContent":" then stream base64 */
+    enum { FIND_AUDIO, STREAM_B64 } state = FIND_AUDIO;
     char search_buf[32];
     int search_len = 0;
-    static const char *PATTERN1 = "\"data\":\"";
-    static const char *PATTERN2 = "\"data\": \"";
-    int pat1_len = 8;
-    int pat2_len = 9;
-    bool first_chunk = true;
+    static const char *PATTERN = "\"audioContent\":\"";
+    static const char *PATTERN2 = "\"audioContent\": \"";
+    int pat_len  = 16;
+    int pat2_len = 17;
 
     unsigned char b64_acc[B64_BUF_SZ];
     int b64_len = 0;
     uint8_t pcm_out[PCM_BUF_SZ];
     size_t total_pcm = 0;
+    size_t total_decoded = 0;  /* includes WAV header bytes */
 
     bool stream_done = false;
     while (!stream_done) {
@@ -92,7 +94,7 @@ static void tts_producer_task(void *arg)
             for (int i = 0; i < rd; i++) {
                 char c = read_buf[i];
 
-                if (state == FIND_DATA) {
+                if (state == FIND_AUDIO) {
                     if (search_len < (int)sizeof(search_buf) - 1) {
                         search_buf[search_len++] = c;
                     } else {
@@ -101,25 +103,22 @@ static void tts_producer_task(void *arg)
                     }
                     search_buf[search_len] = '\0';
 
-                    if ((search_len >= pat1_len &&
-                         memcmp(search_buf + search_len - pat1_len,
-                                PATTERN1, pat1_len) == 0) ||
+                    if ((search_len >= pat_len &&
+                         memcmp(search_buf + search_len - pat_len,
+                                PATTERN, pat_len) == 0) ||
                         (search_len >= pat2_len &&
                          memcmp(search_buf + search_len - pat2_len,
                                 PATTERN2, pat2_len) == 0))
                     {
                         state = STREAM_B64;
                         b64_len = 0;
-                        if (first_chunk) {
-                            ESP_LOGI(TAG, "Found audio data, streaming...");
-                            ESP_LOGI(TAG, "[TIMING] Audio data found: %lld ms from start",
-                                     (esp_timer_get_time() - ctx->t_start) / 1000);
-                            first_chunk = false;
-                        }
+                        ESP_LOGI(TAG, "Found audioContent, streaming...");
+                        ESP_LOGI(TAG, "[TIMING] Audio data found: %lld ms from start",
+                                 (esp_timer_get_time() - ctx->t_start) / 1000);
                     }
                 } else if (state == STREAM_B64) {
                     if (c == '"') {
-                        /* End of this chunk's base64 — flush remainder */
+                        /* End of base64 data — flush remainder */
                         if (b64_len > 0) {
                             while (b64_len % 4 != 0)
                                 b64_acc[b64_len++] = '=';
@@ -127,22 +126,32 @@ static void tts_producer_task(void *arg)
                             mbedtls_base64_decode(pcm_out, sizeof(pcm_out),
                                                   &olen, b64_acc, b64_len);
                             if (olen > 0) {
-                                int16_t *samples = (int16_t *)pcm_out;
-                                for (size_t s = 0; s < olen / 2; s++) {
-                                    size_t g = (total_pcm / 2) + s;
-                                    int32_t v = (int32_t)samples[s] * TTS_VOLUME / 100;
-                                    if (g < FADE_SAMPLES)
-                                        v = v * (int32_t)g / FADE_SAMPLES;
-                                    samples[s] = (int16_t)v;
+                                /* Skip WAV header bytes */
+                                size_t skip = 0;
+                                if (total_decoded < WAV_HEADER_SZ) {
+                                    skip = WAV_HEADER_SZ - total_decoded;
+                                    if (skip > olen) skip = olen;
                                 }
-                                xStreamBufferSend(ctx->sbuf, pcm_out, olen,
-                                                  pdMS_TO_TICKS(5000));
-                                total_pcm += olen;
+                                total_decoded += olen;
+                                if (olen > skip) {
+                                    uint8_t *pcm_start = pcm_out + skip;
+                                    size_t pcm_len = olen - skip;
+                                    int16_t *samples = (int16_t *)pcm_start;
+                                    for (size_t s = 0; s < pcm_len / 2; s++) {
+                                        size_t g = (total_pcm / 2) + s;
+                                        int32_t v = (int32_t)samples[s] * TTS_VOLUME / 100;
+                                        if (g < FADE_SAMPLES)
+                                            v = v * (int32_t)g / FADE_SAMPLES;
+                                        samples[s] = (int16_t)v;
+                                    }
+                                    xStreamBufferSend(ctx->sbuf, pcm_start, pcm_len,
+                                                      pdMS_TO_TICKS(5000));
+                                    total_pcm += pcm_len;
+                                }
                             }
                         }
-                        /* Go back to FIND_DATA for next SSE chunk */
-                        state = FIND_DATA;
-                        search_len = 0;
+                        stream_done = true;
+                        break;
                     }
                     else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
                              (c >= '0' && c <= '9') || c == '+' || c == '/' ||
@@ -154,17 +163,28 @@ static void tts_producer_task(void *arg)
                             mbedtls_base64_decode(pcm_out, sizeof(pcm_out),
                                                   &olen, b64_acc, B64_BUF_SZ);
                             if (olen > 0) {
-                                int16_t *samples = (int16_t *)pcm_out;
-                                for (size_t s = 0; s < olen / 2; s++) {
-                                    size_t g = (total_pcm / 2) + s;
-                                    int32_t v = (int32_t)samples[s] * TTS_VOLUME / 100;
-                                    if (g < FADE_SAMPLES)
-                                        v = v * (int32_t)g / FADE_SAMPLES;
-                                    samples[s] = (int16_t)v;
+                                /* Skip WAV header bytes */
+                                size_t skip = 0;
+                                if (total_decoded < WAV_HEADER_SZ) {
+                                    skip = WAV_HEADER_SZ - total_decoded;
+                                    if (skip > olen) skip = olen;
                                 }
-                                xStreamBufferSend(ctx->sbuf, pcm_out, olen,
-                                                  pdMS_TO_TICKS(5000));
-                                total_pcm += olen;
+                                total_decoded += olen;
+                                if (olen > skip) {
+                                    uint8_t *pcm_start = pcm_out + skip;
+                                    size_t pcm_len = olen - skip;
+                                    int16_t *samples = (int16_t *)pcm_start;
+                                    for (size_t s = 0; s < pcm_len / 2; s++) {
+                                        size_t g = (total_pcm / 2) + s;
+                                        int32_t v = (int32_t)samples[s] * TTS_VOLUME / 100;
+                                        if (g < FADE_SAMPLES)
+                                            v = v * (int32_t)g / FADE_SAMPLES;
+                                        samples[s] = (int16_t)v;
+                                    }
+                                    xStreamBufferSend(ctx->sbuf, pcm_start, pcm_len,
+                                                      pdMS_TO_TICKS(5000));
+                                    total_pcm += pcm_len;
+                                }
                             }
                             b64_len = 0;
                         }
@@ -198,26 +218,24 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
 
     /* ---- Build URL ---- */
     char url[256];
-    snprintf(url, sizeof(url), "%s%s", TTS_URL, CONFIG_GEMINI_API_KEY);
+    snprintf(url, sizeof(url), "%s%s", TTS_URL, CONFIG_CLOUD_TTS_API_KEY);
 
     /* ---- Build JSON body ---- */
     size_t text_len = strlen(text);
-    size_t body_sz = text_len * 2 + 512;   /* worst-case escaped + JSON wrapper */
+    size_t body_sz = text_len * 2 + 512;
     body = malloc(body_sz);
     if (!body) { ret = ESP_ERR_NO_MEM; goto done; }
 
-    /* Escape text for JSON string */
     char *escaped = malloc(text_len * 2 + 1);
     if (!escaped) { ret = ESP_ERR_NO_MEM; goto done; }
     json_escape(text, escaped, text_len * 2 + 1);
 
     int body_len = snprintf(body, body_sz,
-        "{\"contents\":[{\"parts\":[{\"text\":\"%s\"}]}],"
-        "\"generationConfig\":{"
-        "\"responseModalities\":[\"AUDIO\"],"
-        "\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":"
-        "{\"voiceName\":\"%s\"}}}}}",
-        escaped, TTS_VOICE);
+        "{\"input\":{\"text\":\"%s\"},"
+        "\"voice\":{\"languageCode\":\"%s\",\"name\":\"%s\"},"
+        "\"audioConfig\":{\"audioEncoding\":\"LINEAR16\","
+        "\"sampleRateHertz\":%d}}",
+        escaped, TTS_LANG, TTS_VOICE, TTS_RATE);
     free(escaped);
     escaped = NULL;
 
@@ -227,7 +245,7 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
     esp_http_client_config_t cfg = {
         .url              = url,
         .method           = HTTP_METHOD_POST,
-        .timeout_ms       = 60000,
+        .timeout_ms       = 30000,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .buffer_size      = 2048,
         .buffer_size_tx   = 2048,
@@ -237,7 +255,7 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
 
     esp_http_client_set_header(client, "Content-Type", "application/json");
 
-    /* Disable WiFi power save: modem sleep adds >100 ms packet latency */
+    /* Disable WiFi power save */
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     int64_t t_connect = esp_timer_get_time();
@@ -286,7 +304,7 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
     TaskHandle_t prod_handle = NULL;
     BaseType_t created = xTaskCreatePinnedToCore(
         tts_producer_task, "tts_prod", PRODUCER_STACK,
-        &pctx, 5, &prod_handle, 0);   /* Core 0: WiFi/HTTP */
+        &pctx, 5, &prod_handle, 0);
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create producer task");
         ret = ESP_ERR_NO_MEM; goto done;
@@ -323,11 +341,11 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
 
         size_t total_pcm = pctx.total_pcm;
         ESP_LOGI(TAG, "TTS done: %u PCM bytes (%.1f sec at 24 kHz)",
-                 (unsigned)total_pcm, (float)total_pcm / 2 / 24000);
+                 (unsigned)total_pcm, (float)total_pcm / 2 / TTS_RATE);
         ESP_LOGI(TAG, "[TIMING] Total TTS: %lld ms",
                  (esp_timer_get_time() - t_start) / 1000);
 
-        /* Flush silence so speaker doesn't hold last sample */
+        /* Flush silence */
         memset(play_buf, 0, PLAY_CHUNK);
         for (int i = 0; i < 8; i++) {
             size_t w;
