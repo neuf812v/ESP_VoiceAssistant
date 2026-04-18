@@ -2,187 +2,159 @@
 
 ## Overview
 
-Голосовий асистент на ESP32: користувач говорить у мікрофон, отримує голосову відповідь від LLM через динамік.
+Голосовий асистент на ESP32: користувач говорить у мікрофон, отримує голосову відповідь від Gemini через динамік.
 
 ```
-[INMP441 Mic] → ESP32 → WiFi → [Gemini API] → ESP32 → [MAX98357A Speaker]
-                                     ↕
-                              [Google Cloud TTS]
+[INMP441 Mic] → I2S RX → PCM 16kHz/16bit → base64 WAV
+    → HTTPS POST → Gemini 2.5 Flash (аудіо → текст)
+    → текст відповіді → HTTPS POST → Gemini 3.1 Flash TTS
+    → base64 PCM 24kHz → ring buffer → I2S TX → [MAX98357A Speaker]
 ```
 
 ## Чому Gemini?
 
-**Gemini 2.0 Flash** — оптимальний вибір для цього проєкту:
+**Gemini 2.5 Flash** — приймає аудіо напряму (multimodal), не потрібен окремий STT.
+**Gemini 3.1 Flash TTS Preview** — генерує мовлення з тексту, підтримує українську.
 
-| Критерій | Gemini 2.0 Flash | OpenAI GPT-4o | Claude |
-|----------|------------------|---------------|--------|
-| Безкоштовний рівень | ✅ 15 RPM, 1M токенів/хв | ❌ Платний | ❌ Платний |
-| Аудіо на вході | ✅ Нативно (multimodal) | ✅ Нативно | ❌ Тільки текст |
-| Швидкість відповіді | ~1-2 сек | ~2-3 сек | ~2-3 сек |
-| Якість відповідей | Відмінна | Відмінна | Відмінна |
-| Простота API | REST + JSON | REST + JSON | REST + JSON |
-
-**Ключова перевага Gemini**: приймає аудіо напряму (base64 PCM/WAV), тому **не потрібен окремий STT сервіс**. Це спрощує архітектуру і зменшує латентність.
-
-**Альтернативи, якщо Gemini не підходить:**
-- **OpenAI GPT-4o** — також multimodal, але платний з першого запиту
-- **Традиційний пайплайн**: Whisper (STT) → будь-який LLM → TTS — більше API-викликів, більша затримка
+| Критерій | Gemini | OpenAI GPT-4o | Whisper + LLM + TTS |
+|----------|--------|---------------|----------------------|
+| API-виклики на запит | 2 | 3 (STT+LLM+TTS) | 3 |
+| Аудіо на вході | Нативно | Нативно | Whisper окремо |
+| Латентність | Низька | Середня | Висока |
+| Білінг | Prepay credits | Pay-as-you-go | Залежить |
 
 ## Архітектура системи
 
 ### Компоненти
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                     ESP32 Firmware                   │
-│                                                      │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────────┐  │
-│  │ i2s_mic  │  │i2s_speaker│  │   wifi_manager    │  │
-│  │ (INMP441)│  │(MAX98357A)│  │ (STA connection)  │  │
-│  └────┬─────┘  └─────▲────┘  └────────┬──────────┘  │
-│       │              │                │              │
-│  ┌────▼──────────────┴────────────────▼──────────┐  │
-│  │              voice_assistant                    │  │
-│  │  (головний модуль-оркестратор)                  │  │
-│  └────┬───────────────────────────────┬──────────┘  │
-│       │                               │              │
-│  ┌────▼─────────┐           ┌────────▼───────────┐  │
-│  │ gemini_client│           │    tts_client       │  │
-│  │ (HTTP POST)  │           │  (Google Cloud TTS) │  │
-│  └──────────────┘           └────────────────────┘  │
-│                                                      │
-│  ┌──────────────────────────────────────────────┐   │
-│  │              button / trigger                  │   │
-│  │         (GPIO кнопка для PTT)                  │   │
-│  └──────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                      ESP32 Firmware                       │
+│                                                           │
+│  ┌──────────┐  ┌───────────┐  ┌───────────────────────┐  │
+│  │ i2s_mic  │  │i2s_speaker│  │    wifi_manager       │  │
+│  │(INMP441) │  │(MAX98357A)│  │ (STA, auto-reconnect) │  │
+│  └────┬─────┘  └─────▲─────┘  └──────────┬────────────┘  │
+│       │              │                    │               │
+│  ┌────▼──────────────┴────────────────────▼────────────┐  │
+│  │               main.c (assistant_task)               │  │
+│  │     Core 1, пріоритет 6 — оркестрація пайплайну     │  │
+│  └────┬────────────────────────────────────┬───────────┘  │
+│       │                                    │              │
+│  ┌────▼──────────┐              ┌─────────▼───────────┐  │
+│  │ gemini_client │              │    tts_client        │  │
+│  │ Gemini 2.5    │              │  Gemini 3.1 TTS      │  │
+│  │ (аудіо→текст) │              │  (текст→мовлення)    │  │
+│  └───────────────┘              │                      │  │
+│                                 │  ┌────────────────┐  │  │
+│                                 │  │ Producer (C0)  │  │  │
+│                                 │  │ HTTP→decode→   │  │  │
+│                                 │  │ ring buffer    │  │  │
+│                                 │  └───────┬────────┘  │  │
+│                                 │  ┌───────▼────────┐  │  │
+│                                 │  │ Consumer (C1)  │  │  │
+│                                 │  │ ring buf→I2S   │  │  │
+│                                 │  └────────────────┘  │  │
+│                                 └──────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ### Модулі
 
-| Модуль | Файли | Опис |
-|--------|-------|------|
-| **i2s_mic** | `i2s_mic.h/.c` | Драйвер INMP441 (вже готовий) |
-| **i2s_speaker** | `i2s_speaker.h/.c` | Драйвер MAX98357A (вже готовий) |
-| **wifi_manager** | `wifi_manager.h/.c` | WiFi STA підключення, reconnect |
-| **gemini_client** | `gemini_client.h/.c` | HTTP POST до Gemini API з аудіо, отримання тексту |
-| **tts_client** | `tts_client.h/.c` | HTTP POST до Google Cloud TTS, отримання PCM аудіо |
-| **audio_codec** | `audio_codec.h/.c` | WAV header builder, MP3 decode (якщо потрібно) |
-| **voice_assistant** | `voice_assistant.h/.c` | Оркестратор: запис → Gemini → TTS → програвання |
-| **main** | `main.c` | Ініціалізація, кнопка, запуск |
+| Модуль | Файли | Статус | Опис |
+|--------|-------|--------|------|
+| **i2s_mic** | `i2s_mic.h/.c` | ✅ | INMP441, I2S0 RX, 16 kHz, 32→16 bit |
+| **i2s_speaker** | `i2s_speaker.h/.c` | ✅ | MAX98357A, I2S1 TX, 16/24 kHz, DMA 8×480 |
+| **wifi_manager** | `wifi_manager.h/.c` | ✅ | WiFi STA, max 10 retries, auto-reconnect |
+| **gemini_client** | `gemini_client.h/.c` | ✅ | Стрімінг base64 WAV, thinking budget 256 |
+| **tts_client** | `tts_client.h/.c` | ✅ | Ring buffer (12KB), producer/consumer, fade-in |
+| **main** | `main.c` | ✅ | 7 тестових режимів + assistant pipeline |
 
 ## Data Flow (потік даних)
 
 ### 1. Запис голосу
 ```
-INMP441 → I2S RX (32-bit, 16kHz) → конвертація в 16-bit PCM → буфер в RAM
+INMP441 → I2S0 RX (32-bit, 16kHz, mono) → зсув >>16 → 16-bit PCM → буфер в RAM
 ```
-- Макс тривалість: 4 сек (128KB при 16kHz/16bit)
-- Кнопка PTT (Push-To-Talk): натиснув → запис, відпустив → зупинка
+- Тривалість: 3 сек (96KB при 16kHz/16bit)
+- Тригер: ENTER в серійному моніторі
+- DC offset removal після запису
 
-### 2. Відправка до Gemini
+### 2. Відправка до Gemini (gemini_client)
 ```
-PCM буфер → base64 encode → HTTP POST JSON → Gemini API
-```
-
-**Gemini API Request:**
-```json
-{
-  "contents": [{
-    "parts": [
-      {
-        "inline_data": {
-          "mime_type": "audio/pcm;rate=16000",
-          "data": "<base64 encoded PCM>"
-        }
-      },
-      {
-        "text": "Ти голосовий асистент. Відповідай коротко і українською."
-      }
-    ]
-  }],
-  "generationConfig": {
-    "maxOutputTokens": 200
-  }
-}
+PCM буфер → стрімінг base64 WAV (768-byte чанки) → HTTP POST → Gemini 2.5 Flash
 ```
 
-**Розмір запиту**: 4 сек PCM = 128KB → base64 ≈ 171KB
-**Обмеження пам'яті**: Потрібно відправляти чанками (chunked HTTP) або використовувати streaming.
+- Модель: `gemini-2.5-flash`
+- thinkingBudget: 256 (всередині generationConfig)
+- maxOutputTokens: 2048
+- Промпт: Q/A формат, 1-3 речення українською
+- Парсинг: знаходить останній `text` (пропускає thinking)
 
-### 3. Отримання відповіді від Gemini
+### 3. Text-to-Speech (tts_client)
 ```
-Gemini API → JSON response → парсинг тексту відповіді
-```
-- Відповідь: текст (кілька речень)
-- Парсинг: мінімальний JSON-парсер або cJSON (є в ESP-IDF)
-
-### 4. Text-to-Speech
-```
-Текст відповіді → HTTP POST → Google Cloud TTS API → аудіо (LINEAR16 PCM)
+Текст "A:" частини → HTTP POST → Gemini 3.1 Flash TTS Preview
+    → стрімінг base64 → decode → PCM 24kHz/16bit → ring buffer
+    → consumer task → I2S TX → MAX98357A → динамік
 ```
 
-**Google Cloud TTS Request:**
-```json
-{
-  "input": {"text": "Відповідь від Gemini"},
-  "voice": {"languageCode": "uk-UA", "name": "uk-UA-Wavenet-A"},
-  "audioConfig": {
-    "audioEncoding": "LINEAR16",
-    "sampleRateHertz": 16000
-  }
-}
+- Модель: `gemini-3.1-flash-tts-preview`
+- Голос: Kore
+- Ring buffer: 12KB (~250мс) — FreeRTOS StreamBuffer
+- Producer task (Core 0): HTTP read → base64 decode → ring buffer
+- Consumer (Core 1): ring buffer → I2S write
+- Pre-fill: 6KB в ring buffer перед першим I2S write
+- Volume: 75% (запобігає brownout)
+- Fade-in: 1200 семплів (50мс)
+
+### 4. Повний пайплайн (assistant_task, Core 1)
 ```
-
-**Чому LINEAR16 (PCM)**: не потрібен MP3 декодер на ESP32, можна грати напряму.
-
-**Альтернатива TTS**: Google Cloud TTS потребує API key і має ліміти. Безкоштовні варіанти:
-- **ESP-IDF TTS** (офлайн, але тільки англійська/китайська)
-- **Gemini з TTS output** (якщо API підтримує audio response)
-
-### 5. Програвання відповіді
+ENTER → запис 3с → DC removal → gemini_ask()
+    → витягнути "A:" → вимкнути мік I2S
+    → init speaker 24kHz → 50мс delay
+    → tts_speak() → deinit speaker → увімкнути мік
 ```
-PCM аудіо з TTS → streaming через I2S TX → MAX98357A → динамік
-```
-- Streaming: отримати чанк → одразу грати (без буферизації всієї відповіді)
-- DC offset removal + auto-gain (вже реалізовано)
+Мікрофон вимикається під час TTS для зменшення споживання.
 
-## Обмеження ESP32 та рішення
+## Обмеження та рішення
 
 | Обмеження | Рішення |
 |-----------|---------|
-| RAM 320KB | Streaming аудіо, не буферизувати все |
-| Flash 2MB | Мінімум бібліотек, без SPIFFS |
-| Brownout при гучному звуку | Auto-gain, fade-in (вже реалізовано) |
-| Base64 encoding великого аудіо | Chunked HTTP transfer |
-| Латентність мережі | Показувати стан LED (запис/обробка/відповідь) |
-| WiFi reconnect | Auto-reconnect в wifi_manager |
+| RAM 320KB, без PSRAM | Стрімінг: base64 encode/decode чанками, ring buffer 12KB |
+| Flash 2MB (92-94% зайнято) | Мінімум бібліотек, mbedtls cert bundle |
+| Brownout при TTS + WiFi | Volume 75%, fade-in, мік вимикається під час TTS |
+| I2S DMA underrun | Ring buffer + producer/consumer на різних ядрах |
+| WiFi modem sleep latency | WiFi PS_NONE під час TTS |
+| Brownout threshold | CONFIG_ESP_BROWNOUT_DET_LVL_SEL_5 (2.27V), USB 3.0 порт |
 
-## Тригер (кнопка)
+## Секрети та конфігурація
 
-Замість ENTER в серійному моніторі — **фізична кнопка PTT (Push-To-Talk)**:
-- GPIO пін з pull-up
-- Натиснув і тримаєш → запис
-- Відпустив → відправка до Gemini
-- LED індикатор стану
+Секрети зберігаються окремо від основної конфігурації:
 
-Альтернатива: **wake word detection** (наприклад "Hey ESP") — але це потребує додаткової бібліотеки і обчислювальних ресурсів.
+| Файл | В git | Зміст |
+|------|-------|-------|
+| `sdkconfig.defaults` | ✅ | Flash size, brownout, mbedtls |
+| `secrets.defaults` | ❌ | WiFi SSID/password, API key |
+| `secrets.defaults.example` | ✅ | Шаблон для копіювання |
+| `Kconfig.projbuild` | ✅ | Menuconfig опції |
 
-## API Keys
+`CMakeLists.txt` завантажує обидва файли через `SDKCONFIG_DEFAULTS`.
 
-Зберігаються в `sdkconfig` через Kconfig (menuconfig):
-- `CONFIG_WIFI_SSID` / `CONFIG_WIFI_PASSWORD`
-- `CONFIG_GEMINI_API_KEY`
-- `CONFIG_GOOGLE_TTS_API_KEY` (якщо окремий від Gemini)
+## Тригер
 
-**Не хардкодити в коді!**
+Поточний: **ENTER** в серійному моніторі (USB).
+
+Плановані варіанти:
+- **Кнопка PTT** — GPIO з pull-up, натиснув→запис, відпустив→відправка
+- **Wake word** — потребує ESP32-S3 з PSRAM (ESP-SR) або Picovoice Porcupine
+- **VAD** (Voice Activity Detection) — детекція голосу за RMS порогом
 
 ## Порядок реалізації
 
-1. **WiFi Manager** — підключення до мережі
-2. **Gemini Client** — відправка тексту, отримання відповіді (тест без аудіо)
-3. **Gemini + аудіо** — відправка PCM, отримання текстової відповіді
-4. **TTS Client** — перетворення тексту у мовлення
-5. **Voice Assistant** — повний пайплайн: мікрофон → Gemini → TTS → динамік
-6. **Кнопка PTT** — фізичний тригер замість серійного монітора
-7. **LED індикатор** — стан (idle / recording / processing / speaking)
+1. ~~WiFi Manager~~ ✅
+2. ~~Gemini Client (аудіо → текст)~~ ✅
+3. ~~TTS Client (текст → мовлення)~~ ✅
+4. ~~Voice Assistant pipeline~~ ✅
+5. ~~Ring buffer (anti-stutter)~~ ✅
+6. Кнопка PTT / Wake word
+7. LED індикатор стану
