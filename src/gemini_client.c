@@ -20,7 +20,7 @@ static const char *PROMPT =
     "Розпізнай мовлення і ВІДПОВІДАЙ на запитання. "
     "Ти НЕ знаєш поточний час, дату, погоду — чесно скажи що не маєш цієї інформації. "
     "Не вигадуй факти. "
-    "Формат:\\nQ: <транскрипція>\\nA: <відповідь 1-3 речення українською>";
+    "Формат:\\nQ: <транскрипція>\\nA: <повна відповідь українською>";
 
 /* Base64 chunk size: 768 bytes in → 1024 chars out (768 is multiple of 3) */
 #define B64_IN   768
@@ -98,7 +98,7 @@ esp_err_t gemini_ask(const int16_t *pcm_data, size_t num_samples,
     char json_suf[768];
     snprintf(json_suf, sizeof(json_suf),
              "\"}},{\"text\":\"%s\"}]}],"
-             "\"generationConfig\":{\"maxOutputTokens\":2048,"
+             "\"generationConfig\":{\"maxOutputTokens\":8192,"
              "\"thinkingConfig\":{\"thinkingBudget\":256}}}",
              PROMPT);
 

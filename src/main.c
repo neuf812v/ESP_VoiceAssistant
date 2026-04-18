@@ -19,6 +19,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 
 #include "i2s_mic.h"
 #include "i2s_speaker.h"
@@ -44,6 +45,24 @@ static const char *TAG = "main";
 #define BUF_LEN       128   // samples per read/write cycle
 #define REC_SECONDS   3
 #define REC_SAMPLES   (SAMPLE_RATE * REC_SECONDS)  // 48000 samples
+
+#define BTN_BOOT      GPIO_NUM_0    // BOOT button = PTT
+
+static void btn_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << BTN_BOOT),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+}
+
+/* BOOT button: pressed = LOW (0), released = HIGH (1) */
+static inline bool btn_pressed(void) { return gpio_get_level(BTN_BOOT) == 0; }
+
 // GAIN is now computed automatically based on recorded signal level
 
 // ====== Mic test: read and print RMS ======
@@ -395,7 +414,7 @@ static void tts_test_task(void *arg)
 // ====== Voice Assistant: mic → Gemini → TTS → speaker ======
 static void assistant_task(void *arg)
 {
-    uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
+    btn_init();
 
     /* Init mic (always needed) */
     i2s_chan_handle_t rx_handle;
@@ -418,22 +437,20 @@ static void assistant_task(void *arg)
     char response[1024];
 
     while (1) {
-        ESP_LOGI(TAG, ">>> Press ENTER to ask a question <<<");
-        uart_flush_input(UART_NUM_0);
-        while (!uart_enter_pressed()) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+        ESP_LOGI(TAG, ">>> Hold BOOT button to record <<<");
+        /* Wait for button press */
+        while (!btn_pressed()) {
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
+        vTaskDelay(pdMS_TO_TICKS(50));  /* debounce */
+        if (!btn_pressed()) continue;   /* false trigger */
 
-        /* --- Record --- */
-        uart_flush_input(UART_NUM_0);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        uart_flush_input(UART_NUM_0);
-        ESP_LOGI(TAG, ">>> RECORDING — speak now! <<<");
+        /* --- Record while button held --- */
+        ESP_LOGI(TAG, ">>> RECORDING — speak now! Release to send <<<");
         size_t total_recorded = 0;
         size_t bytes_read;
 
-        while (total_recorded < REC_SAMPLES) {
-            if (uart_enter_pressed()) break;
+        while (btn_pressed() && total_recorded < REC_SAMPLES) {
             size_t to_read = REC_SAMPLES - total_recorded;
             if (to_read > BUF_LEN) to_read = BUF_LEN;
             esp_err_t err = i2s_mic_read(rx_handle, mic_buf,

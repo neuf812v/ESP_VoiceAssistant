@@ -66,8 +66,8 @@
 | **i2s_mic** | `i2s_mic.h/.c` | ✅ | INMP441, I2S0 RX, 16 kHz, 32→16 bit |
 | **i2s_speaker** | `i2s_speaker.h/.c` | ✅ | MAX98357A, I2S1 TX, 16/24 kHz, DMA 8×480 |
 | **wifi_manager** | `wifi_manager.h/.c` | ✅ | WiFi STA, max 10 retries, auto-reconnect |
-| **gemini_client** | `gemini_client.h/.c` | ✅ | Стрімінг base64 WAV, thinking budget 256 |
-| **tts_client** | `tts_client.h/.c` | ✅ | Ring buffer (12KB), producer/consumer, fade-in |
+| **gemini_client** | `gemini_client.h/.c` | ✅ | Стрімінг base64 WAV, thinking budget 256, maxOutputTokens 8192 |
+| **tts_client** | `tts_client.h/.c` | ✅ | Ring buffer (12KB), producer/consumer, fade-in, SSE streaming |
 | **main** | `main.c` | ✅ | 7 тестових режимів + assistant pipeline |
 
 ## Data Flow (потік даних)
@@ -76,8 +76,8 @@
 ```
 INMP441 → I2S0 RX (32-bit, 16kHz, mono) → зсув >>16 → 16-bit PCM → буфер в RAM
 ```
-- Тривалість: 3 сек (96KB при 16kHz/16bit)
-- Тригер: ENTER в серійному моніторі
+- Тривалість: до 3 сек (96KB при 16kHz/16bit)
+- Тригер: **BOOT кнопка** (GPIO0) — натиснув→запис, відпустив→відправка
 - DC offset removal після запису
 
 ### 2. Відправка до Gemini (gemini_client)
@@ -87,8 +87,8 @@ PCM буфер → стрімінг base64 WAV (768-byte чанки) → HTTP PO
 
 - Модель: `gemini-2.5-flash`
 - thinkingBudget: 256 (всередині generationConfig)
-- maxOutputTokens: 2048
-- Промпт: Q/A формат, 1-3 речення українською
+- maxOutputTokens: 8192 (повні відповіді без обмеження довжини)
+- Промпт: Q/A формат, повна відповідь українською
 - Парсинг: знаходить останній `text` (пропускає thinking)
 
 ### 3. Text-to-Speech (tts_client)
@@ -99,6 +99,7 @@ PCM буфер → стрімінг base64 WAV (768-byte чанки) → HTTP PO
 ```
 
 - Модель: `gemini-3.1-flash-tts-preview`
+- Ендпоінт: `streamGenerateContent?alt=sse` (SSE streaming)
 - Голос: Kore
 - Ring buffer: 12KB (~250мс) — FreeRTOS StreamBuffer
 - Producer task (Core 0): HTTP read → base64 decode → ring buffer
@@ -109,12 +110,28 @@ PCM буфер → стрімінг base64 WAV (768-byte чанки) → HTTP PO
 
 ### 4. Повний пайплайн (assistant_task, Core 1)
 ```
-ENTER → запис 3с → DC removal → gemini_ask()
+BOOT натиснуто → запис (до 3с) → BOOT відпущено
+    → DC removal → gemini_ask()
     → витягнути "A:" → вимкнути мік I2S
     → init speaker 24kHz → 50мс delay
     → tts_speak() → deinit speaker → увімкнути мік
 ```
 Мікрофон вимикається під час TTS для зменшення споживання.
+
+## Латентність та таймінги
+
+Типовий цикл запит-відповідь (виміряно через `esp_timer`):
+
+| Етап | Час |
+|------|-----|
+| Gemini STT+LLM (текст) | ~5-6 сек |
+| TLS connect (TTS) | ~2.2 сек |
+| **TTS TTFB (серверний синтез)** | **~8-13 сек** |
+| Перший звук від відпускання кнопки | ~15-18 сек |
+
+**Головне обмеження**: Gemini TTS синтезує весь аудіофайл цілком на сервері перед відправкою. Навіть з `streamGenerateContent` (SSE) аудіо приходить одним блоком. TTFB пропорційний довжині тексту:
+- Коротка відповідь (~1-2 речення): TTFB ~8 сек
+- Довга відповідь (~5-6 речень): TTFB ~13 сек
 
 ## Обмеження та рішення
 
@@ -142,12 +159,12 @@ ENTER → запис 3с → DC removal → gemini_ask()
 
 ## Тригер
 
-Поточний: **ENTER** в серійному моніторі (USB).
+Поточний: **BOOT кнопка (GPIO0)** — Push-to-Talk. Натиснув→запис, відпустив→відправка.
 
-Плановані варіанти:
-- **Кнопка PTT** — GPIO з pull-up, натиснув→запис, відпустив→відправка
+Можливі покращення:
 - **Wake word** — потребує ESP32-S3 з PSRAM (ESP-SR) або Picovoice Porcupine
 - **VAD** (Voice Activity Detection) — детекція голосу за RMS порогом
+- **Зовнішня кнопка** — окремий GPIO замість BOOT
 
 ## Порядок реалізації
 
@@ -156,5 +173,7 @@ ENTER → запис 3с → DC removal → gemini_ask()
 3. ~~TTS Client (текст → мовлення)~~ ✅
 4. ~~Voice Assistant pipeline~~ ✅
 5. ~~Ring buffer (anti-stutter)~~ ✅
-6. Кнопка PTT / Wake word
-7. LED індикатор стану
+6. ~~Кнопка PTT (BOOT / GPIO0)~~ ✅
+7. ~~Таймінг-логи~~ ✅
+8. LED індикатор стану
+9. Google Cloud TTS (швидший TTFB, потребує OAuth2)

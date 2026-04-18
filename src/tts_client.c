@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "mbedtls/base64.h"
@@ -17,7 +18,7 @@ static const char *TAG = "tts";
 /* ---------- Configuration ---------- */
 #define TTS_MODEL     "gemini-3.1-flash-tts-preview"
 #define TTS_URL       "https://generativelanguage.googleapis.com/v1beta/models/" \
-                      TTS_MODEL ":generateContent?key="
+                      TTS_MODEL ":streamGenerateContent?alt=sse&key="
 #define TTS_VOICE     "Kore"
 
 #define READ_BUF_SZ   4096
@@ -61,6 +62,7 @@ typedef struct {
     StreamBufferHandle_t     sbuf;
     volatile bool            done;
     volatile size_t          total_pcm;
+    int64_t                  t_start;
 } producer_ctx_t;
 
 static void tts_producer_task(void *arg)
@@ -69,23 +71,25 @@ static void tts_producer_task(void *arg)
     char *read_buf = malloc(READ_BUF_SZ);
     if (!read_buf) { ctx->done = true; vTaskDelete(NULL); return; }
 
-    enum { FIND_DATA, STREAM_B64, PARSE_DONE } state = FIND_DATA;
+    enum { FIND_DATA, STREAM_B64 } state = FIND_DATA;
     char search_buf[32];
     int search_len = 0;
     static const char *PATTERN1 = "\"data\":\"";
     static const char *PATTERN2 = "\"data\": \"";
     int pat1_len = 8;
     int pat2_len = 9;
+    bool first_chunk = true;
 
     unsigned char b64_acc[B64_BUF_SZ];
     int b64_len = 0;
     uint8_t pcm_out[PCM_BUF_SZ];
     size_t total_pcm = 0;
 
-    while (state != PARSE_DONE) {
+    bool stream_done = false;
+    while (!stream_done) {
         int rd = esp_http_client_read(ctx->client, read_buf, READ_BUF_SZ);
         if (rd > 0) {
-            for (int i = 0; i < rd && state != PARSE_DONE; i++) {
+            for (int i = 0; i < rd; i++) {
                 char c = read_buf[i];
 
                 if (state == FIND_DATA) {
@@ -106,11 +110,16 @@ static void tts_producer_task(void *arg)
                     {
                         state = STREAM_B64;
                         b64_len = 0;
-                        ESP_LOGI(TAG, "Found audio data, streaming...");
+                        if (first_chunk) {
+                            ESP_LOGI(TAG, "Found audio data, streaming...");
+                            ESP_LOGI(TAG, "[TIMING] Audio data found: %lld ms from start",
+                                     (esp_timer_get_time() - ctx->t_start) / 1000);
+                            first_chunk = false;
+                        }
                     }
-                }
-                else if (state == STREAM_B64) {
+                } else if (state == STREAM_B64) {
                     if (c == '"') {
+                        /* End of this chunk's base64 — flush remainder */
                         if (b64_len > 0) {
                             while (b64_len % 4 != 0)
                                 b64_acc[b64_len++] = '=';
@@ -131,7 +140,9 @@ static void tts_producer_task(void *arg)
                                 total_pcm += olen;
                             }
                         }
-                        state = PARSE_DONE;
+                        /* Go back to FIND_DATA for next SSE chunk */
+                        state = FIND_DATA;
+                        search_len = 0;
                     }
                     else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
                              (c >= '0' && c <= '9') || c == '+' || c == '/' ||
@@ -183,6 +194,8 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
 
     ESP_LOGI(TAG, "TTS: \"%s\"", text);
 
+    int64_t t_start = esp_timer_get_time();
+
     /* ---- Build URL ---- */
     char url[256];
     snprintf(url, sizeof(url), "%s%s", TTS_URL, CONFIG_GEMINI_API_KEY);
@@ -227,11 +240,14 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
     /* Disable WiFi power save: modem sleep adds >100 ms packet latency */
     esp_wifi_set_ps(WIFI_PS_NONE);
 
+    int64_t t_connect = esp_timer_get_time();
     ret = esp_http_client_open(client, body_len);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "HTTP open: %s", esp_err_to_name(ret));
         goto done;
     }
+    ESP_LOGI(TAG, "[TIMING] TLS connect: %lld ms",
+             (esp_timer_get_time() - t_connect) / 1000);
 
     /* ---- Write request body ---- */
     if (esp_http_client_write(client, body, body_len) < 0) {
@@ -241,9 +257,12 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
     free(body); body = NULL;
 
     /* ---- Read response headers ---- */
+    int64_t t_wait = esp_timer_get_time();
     int hdr_len = esp_http_client_fetch_headers(client);
     int status  = esp_http_client_get_status_code(client);
     ESP_LOGI(TAG, "HTTP %d  content-length: %d", status, hdr_len);
+    ESP_LOGI(TAG, "[TIMING] Server response (TTFB): %lld ms",
+             (esp_timer_get_time() - t_wait) / 1000);
 
     if (status != 200) {
         char err_buf[512];
@@ -261,6 +280,7 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
         .sbuf      = sbuf,
         .done      = false,
         .total_pcm = 0,
+        .t_start   = t_start,
     };
 
     TaskHandle_t prod_handle = NULL;
@@ -288,6 +308,8 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
 
         ESP_LOGI(TAG, "Pre-fill done (%u bytes), starting playback",
                  (unsigned)xStreamBufferBytesAvailable(sbuf));
+        ESP_LOGI(TAG, "[TIMING] First audio out: %lld ms from start",
+                 (esp_timer_get_time() - t_start) / 1000);
 
         /* Drain ring buffer → I2S */
         while (!pctx.done || xStreamBufferBytesAvailable(sbuf) > 0) {
@@ -302,6 +324,8 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
         size_t total_pcm = pctx.total_pcm;
         ESP_LOGI(TAG, "TTS done: %u PCM bytes (%.1f sec at 24 kHz)",
                  (unsigned)total_pcm, (float)total_pcm / 2 / 24000);
+        ESP_LOGI(TAG, "[TIMING] Total TTS: %lld ms",
+                 (esp_timer_get_time() - t_start) / 1000);
 
         /* Flush silence so speaker doesn't hold last sample */
         memset(play_buf, 0, PLAY_CHUNK);
