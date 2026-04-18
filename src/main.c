@@ -14,10 +14,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_sntp.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 
@@ -47,6 +52,148 @@ static const char *TAG = "main";
 #define REC_SAMPLES   (SAMPLE_RATE * REC_SECONDS)  // 48000 samples
 
 #define BTN_BOOT      GPIO_NUM_0    // BOOT button = PTT
+
+char g_city[64] = "Київ";   /* fallback */
+char g_country[64] = "Україна";
+char g_weather[128] = "";  /* e.g. "18°C, хмарно" */
+static float g_lat = 50.45f;
+static float g_lon = 30.52f;
+
+/* ---------- NTP time sync ---------- */
+static void ntp_sync(void)
+{
+    ESP_LOGI(TAG, "Starting NTP sync...");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+
+    /* Wait up to 10 seconds for time sync */
+    int retry = 0;
+    while (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && retry < 20) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        retry++;
+    }
+    if (retry >= 20) {
+        ESP_LOGW(TAG, "NTP sync timeout — time may be wrong");
+    } else {
+        /* Set timezone to Kyiv (EET-2EEST,M3.5.0/3,M10.5.0/4) */
+        setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
+        tzset();
+        time_t now = time(NULL);
+        struct tm ti;
+        localtime_r(&now, &ti);
+        char buf[64];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M, %A", &ti);
+        ESP_LOGI(TAG, "NTP synced: %s", buf);
+    }
+    esp_sntp_stop();
+}
+
+/* ---------- IP geolocation ---------- */
+static void detect_location(void)
+{
+    esp_http_client_config_t cfg = {
+        .url        = "http://ip-api.com/json/?fields=city,country,lat,lon&lang=uk",
+        .method     = HTTP_METHOD_GET,
+        .timeout_ms = 5000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return;
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) { esp_http_client_cleanup(client); return; }
+
+    esp_http_client_fetch_headers(client);
+    char resp[256];
+    int rd = esp_http_client_read(client, resp, sizeof(resp) - 1);
+    if (rd > 0) {
+        resp[rd] = '\0';
+        /* Simple parse: {"city":"Kyiv","country":"Україна"} */
+        char *p;
+        p = strstr(resp, "\"city\":\"");
+        if (p) {
+            p += 8;
+            char *end = strchr(p, '"');
+            if (end && (end - p) < (int)sizeof(g_city)) {
+                memcpy(g_city, p, end - p);
+                g_city[end - p] = '\0';
+            }
+        }
+        p = strstr(resp, "\"country\":\"");
+        if (p) {
+            p += 11;
+            char *end = strchr(p, '"');
+            if (end && (end - p) < (int)sizeof(g_country)) {
+                memcpy(g_country, p, end - p);
+                g_country[end - p] = '\0';
+            }
+        }
+        ESP_LOGI(TAG, "Location: %s, %s", g_city, g_country);
+        /* Extract lat/lon for weather */
+        p = strstr(resp, "\"lat\":");
+        if (p) g_lat = strtof(p + 6, NULL);
+        p = strstr(resp, "\"lon\":");
+        if (p) g_lon = strtof(p + 6, NULL);
+        ESP_LOGI(TAG, "Coordinates: %.2f, %.2f", g_lat, g_lon);
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+}
+
+/* ---------- Weather (Open-Meteo, free, no API key) ---------- */
+static const char *wmo_description(int code)
+{
+    if (code == 0) return "ясно";
+    if (code <= 3) return "хмарно";
+    if (code <= 49) return "туман";
+    if (code <= 59) return "мряка";
+    if (code <= 69) return "дощ";
+    if (code <= 79) return "сніг";
+    if (code <= 84) return "злива";
+    if (code <= 94) return "сніг";
+    return "гроза";
+}
+
+static void fetch_weather(void)
+{
+    char url[256];
+    snprintf(url, sizeof(url),
+        "http://api.open-meteo.com/v1/forecast?latitude=%.2f&longitude=%.2f"
+        "&current=temperature_2m,weather_code", g_lat, g_lon);
+
+    esp_http_client_config_t cfg = {
+        .url        = url,
+        .method     = HTTP_METHOD_GET,
+        .timeout_ms = 5000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return;
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) { esp_http_client_cleanup(client); return; }
+
+    esp_http_client_fetch_headers(client);
+    char resp[512];
+    int rd = esp_http_client_read(client, resp, sizeof(resp) - 1);
+    if (rd > 0) {
+        resp[rd] = '\0';
+        /* Parse values inside "current":{...} to skip "current_units" */
+        float temp = 0;
+        int wcode = 0;
+        char *cur = strstr(resp, "\"current\":{\"time\"");
+        if (!cur) cur = strstr(resp, "\"current\":{");
+        char *base = cur ? cur : resp;
+        char *p = strstr(base, "\"temperature_2m\":");
+        if (p) temp = strtof(p + 17, NULL);
+        p = strstr(base, "\"weather_code\":");
+        if (p) wcode = atoi(p + 15);
+        snprintf(g_weather, sizeof(g_weather), "%.0f\u00b0C, %s",
+                 temp, wmo_description(wcode));
+        ESP_LOGI(TAG, "Weather: %s", g_weather);
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+}
 
 static void btn_init(void)
 {
@@ -475,6 +622,9 @@ static void assistant_task(void *arg)
         if (dc != 0)
             for (size_t i = 0; i < total_recorded; i++) rec_buf[i] -= dc;
 
+        /* --- Refresh weather --- */
+        fetch_weather();
+
         /* --- Gemini: speech → text --- */
         ESP_LOGI(TAG, ">>> Thinking… <<<");
         esp_err_t err = gemini_ask(rec_buf, total_recorded,
@@ -536,6 +686,11 @@ void app_main(void)
 
     /* Connect to WiFi (blocking, will retry up to 10 times) */
     wifi_manager_init();
+
+    /* NTP + geolocation (only for ASSISTANT mode, but quick) */
+    ntp_sync();
+    detect_location();
+    fetch_weather();
 
 #if TEST_MODE == TEST_MIC
     ESP_LOGI(TAG, "Mode: MIC TEST (check serial for RMS levels)");

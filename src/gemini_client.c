@@ -2,6 +2,8 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
+#include <sys/time.h>
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -15,12 +17,18 @@ static const char *TAG = "gemini";
 #define GEMINI_URL    "https://generativelanguage.googleapis.com/v1beta/models/" \
                       GEMINI_MODEL ":generateContent?key="
 
-static const char *PROMPT =
+static const char *PROMPT_TEMPLATE =
     "Ти голосовий асистент на ESP32. Користувач говорить тобі в мікрофон. "
     "Розпізнай мовлення і ВІДПОВІДАЙ на запитання. "
-    "Ти НЕ знаєш поточний час, дату, погоду — чесно скажи що не маєш цієї інформації. "
+    "Поточний час: %s. Місто: %s, %s. "
+    "Погода зараз: %s. "
     "Не вигадуй факти. "
     "Формат:\\nQ: <транскрипція>\\nA: <повна відповідь українською>";
+
+/* city/country/weather from main.c */
+extern char g_city[64];
+extern char g_country[64];
+extern char g_weather[128];
 
 /* Base64 chunk size: 768 bytes in → 1024 chars out (768 is multiple of 3) */
 #define B64_IN   768
@@ -95,12 +103,25 @@ esp_err_t gemini_ask(const int16_t *pcm_data, size_t num_samples,
         "{\"contents\":[{\"parts\":["
         "{\"inline_data\":{\"mime_type\":\"audio/wav\",\"data\":\"";
 
-    char json_suf[768];
+    /* ---- Build dynamic prompt with current time ---- */
+    char time_str[64] = "невідомо";
+    time_t now = time(NULL);
+    if (now > 1000000000) {  /* time is synced (after ~2001) */
+        struct tm ti;
+        localtime_r(&now, &ti);
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M, %A", &ti);
+    }
+    char prompt[768];
+    snprintf(prompt, sizeof(prompt), PROMPT_TEMPLATE,
+             time_str, g_city, g_country,
+             g_weather[0] ? g_weather : "невідомо");
+
+    char json_suf[1024];
     snprintf(json_suf, sizeof(json_suf),
              "\"}},{\"text\":\"%s\"}]}],"
              "\"generationConfig\":{\"maxOutputTokens\":8192,"
              "\"thinkingConfig\":{\"thinkingBudget\":256}}}",
-             PROMPT);
+             prompt);
 
     size_t pre_len = sizeof(json_pre) - 1;   /* strlen without \0 */
     size_t suf_len = strlen(json_suf);

@@ -12,6 +12,8 @@
 - Генерація мовлення через Gemini 3.1 Flash TTS Preview (24 kHz)
 - Стрімінг аудіо через ring buffer (два FreeRTOS таски) — без заїкань
 - **BOOT кнопка (GPIO0) як Push-to-Talk**: натиснув → говориш, відпустив → відповідь
+- **Контекст реального часу**: NTP час (Київ), геолокація (ip-api.com), погода (Open-Meteo)
+- Gemini знає поточний час, місто та погоду — може відповідати на "Яка година?" і "Яка погода?"
 - Підтримка української мови
 - Fade-in + регулювання гучності для запобігання brownout
 
@@ -73,11 +75,11 @@
 
 ```
 src/
-├── main.c              — точка входу, тестові режими, пайплайн
+├── main.c              — точка входу, тестові режими, пайплайн, NTP, геолокація, погода
 ├── i2s_mic.c/.h        — драйвер INMP441 (I2S RX, 16 kHz, 32-bit)
 ├── i2s_speaker.c/.h    — драйвер MAX98357A (I2S TX, 16/24 kHz)
 ├── wifi_manager.c/.h   — WiFi STA підключення з auto-reconnect
-├── gemini_client.c/.h  — Gemini 2.5 Flash API (аудіо → текст)
+├── gemini_client.c/.h  — Gemini 2.5 Flash API (аудіо → текст, динамічний промпт)
 ├── tts_client.c/.h     — Gemini 3.1 Flash TTS (текст → мовлення)
 └── Kconfig.projbuild   — menuconfig опції (WiFi, API key)
 ```
@@ -109,7 +111,7 @@ Gemini TTS синтезує весь аудіофайл цілком перед 
 1. **Service Account** в Google Cloud Console (з роллю `Cloud Text-to-Speech User`)
 2. **JWT підпис** на ESP32 через mbedtls (RS256 або ES256)
 3. **Token refresh** кожні 60 хвилин
-4. **~5-10KB додаткового flash** (при поточних 94.6% це критично)
+4. **~5-10KB додаткового flash** (при поточних 97.6% це критично — лишилось ~25KB)
 
 **Алгоритм OAuth2 на ESP32**:
 ```
