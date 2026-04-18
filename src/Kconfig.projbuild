@@ -1,0 +1,39 @@
+menu "Voice Assistant Configuration"
+
+    menu "WiFi Settings"
+        config WIFI_SSID
+            string "WiFi SSID"
+            default "my_ssid"
+            help
+                SSID of your WiFi network.
+
+        config WIFI_PASSWORD
+            string "WiFi Password"
+            default "my_password"
+            help
+                Password of your WiFi network.
+    endmenu
+
+    menu "API Keys"
+        config GEMINI_API_KEY
+            string "Gemini API Key"
+            default ""
+            help
+                Google Gemini API key for LLM queries.
+    endmenu
+
+    choice TEST_MODE_SELECT
+        prompt "Audio test mode"
+        default TEST_LOOPBACK
+        help
+            Select the audio test mode
+
+        config TEST_MIC
+            bool "Microphone only (RMS to serial)"
+        config TEST_SPEAKER
+            bool "Speaker only (1kHz sine)"
+        config TEST_LOOPBACK
+            bool "Loopback (mic -> speaker)"
+    endchoice
+
+endmenu

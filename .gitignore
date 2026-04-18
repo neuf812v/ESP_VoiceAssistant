@@ -1,0 +1,5 @@
+.pio/
+.vscode/
+sdkconfig.esp32dev
+sdkconfig.*.old
+secrets.defaults
