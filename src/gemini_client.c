@@ -16,6 +16,8 @@ static const char *TAG = "gemini";
 #define GEMINI_MODEL  "gemini-2.5-flash"
 #define GEMINI_URL    "https://generativelanguage.googleapis.com/v1beta/models/" \
                       GEMINI_MODEL ":generateContent?key="
+#define GEMINI_MAX_RETRIES  3
+#define GEMINI_RETRY_DELAY_MS  1500
 
 static const char *PROMPT_TEMPLATE =
     "Ти голосовий асистент на ESP32. Користувач говорить тобі в мікрофон. "
@@ -27,7 +29,7 @@ static const char *PROMPT_TEMPLATE =
     "(наприклад: 'двадцять один градус', 'п'ять градусів', "
     "'о сьомій тридцять', 'дванадцята година'). "
     "Став наголоси (символ \\u0301) на словах де наголос може бути неочевидним "
-    "(Бе\\u0301регове, а НЕ Берегове\\u0301). "
+    "(Бе\\u0301регове, за\\u0301раз, а НЕ Берегове\\u0301 чи зара\\u0301з). "
     "Формат:\\nQ: <транскрипція>\\nA: <повна відповідь українською>";
 
 /* city/country/weather from main.c */
@@ -88,8 +90,13 @@ static size_t wav_stream_read(const uint8_t *hdr, const uint8_t *pcm,
 }
 
 /* ---------- Main API ---------- */
-esp_err_t gemini_ask(const int16_t *pcm_data, size_t num_samples,
-                     char *response_text, size_t max_response_len)
+static bool gemini_status_is_retryable(int status)
+{
+    return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
+}
+
+static esp_err_t gemini_ask_once(const int16_t *pcm_data, size_t num_samples,
+                                 char *response_text, size_t max_response_len)
 {
     esp_err_t ret = ESP_FAIL;
     esp_http_client_handle_t client = NULL;
@@ -225,7 +232,8 @@ esp_err_t gemini_ask(const int16_t *pcm_data, size_t num_samples,
 
         if (status != 200) {
             ESP_LOGE(TAG, "API error (%d): %.500s", status, resp_buf);
-            ret = ESP_FAIL; goto done;
+            ret = gemini_status_is_retryable(status) ? ESP_ERR_TIMEOUT : ESP_FAIL;
+            goto done;
         }
 
         /* ---- 5) Parse JSON — find the last "text" part (skip thinking) ---- */
@@ -270,5 +278,29 @@ done:
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
     }
+    return ret;
+}
+
+esp_err_t gemini_ask(const int16_t *pcm_data, size_t num_samples,
+                     char *response_text, size_t max_response_len)
+{
+    esp_err_t ret = ESP_FAIL;
+
+    for (int attempt = 1; attempt <= GEMINI_MAX_RETRIES; attempt++) {
+        ret = gemini_ask_once(pcm_data, num_samples, response_text, max_response_len);
+        if (ret == ESP_OK) {
+            return ESP_OK;
+        }
+
+        if (ret != ESP_ERR_TIMEOUT || attempt == GEMINI_MAX_RETRIES) {
+            break;
+        }
+
+        int delay_ms = GEMINI_RETRY_DELAY_MS * attempt;
+        ESP_LOGW(TAG, "Gemini temporary failure, retry %d/%d in %d ms",
+                 attempt + 1, GEMINI_MAX_RETRIES, delay_ms);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+
     return ret;
 }

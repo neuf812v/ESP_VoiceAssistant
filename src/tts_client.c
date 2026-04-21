@@ -1,5 +1,6 @@
 #include "tts_client.h"
 
+#include <ctype.h>
 #include <string.h>
 #include <stdio.h>
 #include "esp_log.h"
@@ -31,6 +32,96 @@ static const char *TAG = "tts";
 #define PLAY_CHUNK    768           /* consumer I2S write chunk */
 #define PRODUCER_STACK 6144
 #define WAV_HEADER_SZ 44            /* WAV header to skip for LINEAR16 */
+
+typedef struct {
+    const char *from;
+    const char *to;
+} stress_fix_t;
+
+static const stress_fix_t STRESS_FIXES[] = {
+    {"зараз", "за\xCC\x81раз"},
+    {"Зараз", "За\xCC\x81раз"},
+};
+
+static bool is_word_boundary_byte(char ch)
+{
+    unsigned char uch = (unsigned char)ch;
+
+    if (ch == '\0') {
+        return true;
+    }
+
+    return uch < 0x80 && !isalnum(uch) && ch != '_';
+}
+
+static size_t count_stress_fix_matches(const char *text, const char *from)
+{
+    size_t matches = 0;
+    size_t from_len = strlen(from);
+    const char *p = text;
+
+    while ((p = strstr(p, from)) != NULL) {
+        char prev = (p == text) ? '\0' : p[-1];
+        char next = p[from_len];
+
+        if (is_word_boundary_byte(prev) && is_word_boundary_byte(next)) {
+            matches++;
+        }
+        p += from_len;
+    }
+
+    return matches;
+}
+
+static char *apply_stress_fixes(const char *text)
+{
+    size_t out_len = strlen(text);
+
+    for (size_t i = 0; i < sizeof(STRESS_FIXES) / sizeof(STRESS_FIXES[0]); i++) {
+        size_t count = count_stress_fix_matches(text, STRESS_FIXES[i].from);
+        if (count > 0) {
+            out_len += count * (strlen(STRESS_FIXES[i].to) - strlen(STRESS_FIXES[i].from));
+        }
+    }
+
+    char *out = malloc(out_len + 1);
+    if (!out) {
+        return NULL;
+    }
+
+    const char *src = text;
+    char *dst = out;
+    while (*src) {
+        bool replaced = false;
+
+        for (size_t i = 0; i < sizeof(STRESS_FIXES) / sizeof(STRESS_FIXES[0]); i++) {
+            const char *from = STRESS_FIXES[i].from;
+            const char *to = STRESS_FIXES[i].to;
+            size_t from_len = strlen(from);
+
+            if (strncmp(src, from, from_len) == 0) {
+                char prev = (src == text) ? '\0' : src[-1];
+                char next = src[from_len];
+
+                if (is_word_boundary_byte(prev) && is_word_boundary_byte(next)) {
+                    size_t to_len = strlen(to);
+                    memcpy(dst, to, to_len);
+                    dst += to_len;
+                    src += from_len;
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+
+        if (!replaced) {
+            *dst++ = *src++;
+        }
+    }
+
+    *dst = '\0';
+    return out;
+}
 
 /* ---------- JSON text escaping ---------- */
 static size_t json_escape(const char *src, char *dst, size_t dst_sz)
@@ -65,6 +156,46 @@ typedef struct {
     volatile size_t          total_pcm;
     int64_t                  t_start;
 } producer_ctx_t;
+
+static bool stream_buffer_send_all(StreamBufferHandle_t sbuf, const uint8_t *data,
+                                   size_t len, TickType_t chunk_timeout)
+{
+    size_t sent_total = 0;
+
+    while (sent_total < len) {
+        size_t sent = xStreamBufferSend(sbuf, data + sent_total, len - sent_total,
+                                        chunk_timeout);
+        if (sent == 0) {
+            return false;
+        }
+        sent_total += sent;
+    }
+
+    return true;
+}
+
+static esp_err_t i2s_write_all(i2s_chan_handle_t tx_handle, const void *src,
+                               size_t size, uint32_t timeout_ms)
+{
+    const uint8_t *ptr = (const uint8_t *)src;
+    size_t written_total = 0;
+
+    while (written_total < size) {
+        size_t written = 0;
+        esp_err_t err = i2s_speaker_write(tx_handle, ptr + written_total,
+                                          size - written_total, &written,
+                                          timeout_ms);
+        if (err != ESP_OK) {
+            return err;
+        }
+        if (written == 0) {
+            return ESP_ERR_TIMEOUT;
+        }
+        written_total += written;
+    }
+
+    return ESP_OK;
+}
 
 static void tts_producer_task(void *arg)
 {
@@ -144,8 +275,13 @@ static void tts_producer_task(void *arg)
                                             v = v * (int32_t)g / FADE_SAMPLES;
                                         samples[s] = (int16_t)v;
                                     }
-                                    xStreamBufferSend(ctx->sbuf, pcm_start, pcm_len,
-                                                      pdMS_TO_TICKS(5000));
+                                    if (!stream_buffer_send_all(ctx->sbuf, pcm_start,
+                                                                pcm_len,
+                                                                pdMS_TO_TICKS(5000))) {
+                                        ESP_LOGW(TAG, "Ring buffer stalled while streaming audio");
+                                        stream_done = true;
+                                        break;
+                                    }
                                     total_pcm += pcm_len;
                                 }
                             }
@@ -181,8 +317,13 @@ static void tts_producer_task(void *arg)
                                             v = v * (int32_t)g / FADE_SAMPLES;
                                         samples[s] = (int16_t)v;
                                     }
-                                    xStreamBufferSend(ctx->sbuf, pcm_start, pcm_len,
-                                                      pdMS_TO_TICKS(5000));
+                                    if (!stream_buffer_send_all(ctx->sbuf, pcm_start,
+                                                                pcm_len,
+                                                                pdMS_TO_TICKS(5000))) {
+                                        ESP_LOGW(TAG, "Ring buffer stalled while streaming audio");
+                                        stream_done = true;
+                                        break;
+                                    }
                                     total_pcm += pcm_len;
                                 }
                             }
@@ -210,6 +351,7 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
     esp_err_t ret = ESP_FAIL;
     esp_http_client_handle_t client = NULL;
     char *body = NULL;
+    char *normalized = NULL;
     StreamBufferHandle_t sbuf = NULL;
 
     ESP_LOGI(TAG, "TTS: \"%s\"", text);
@@ -221,14 +363,17 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
     snprintf(url, sizeof(url), "%s%s", TTS_URL, CONFIG_CLOUD_TTS_API_KEY);
 
     /* ---- Build JSON body ---- */
-    size_t text_len = strlen(text);
+    normalized = apply_stress_fixes(text);
+    if (!normalized) { ret = ESP_ERR_NO_MEM; goto done; }
+
+    size_t text_len = strlen(normalized);
     size_t body_sz = text_len * 2 + 512;
     body = malloc(body_sz);
     if (!body) { ret = ESP_ERR_NO_MEM; goto done; }
 
     char *escaped = malloc(text_len * 2 + 1);
     if (!escaped) { ret = ESP_ERR_NO_MEM; goto done; }
-    json_escape(text, escaped, text_len * 2 + 1);
+    json_escape(normalized, escaped, text_len * 2 + 1);
 
     int body_len = snprintf(body, body_sz,
         "{\"input\":{\"text\":\"%s\"},"
@@ -316,8 +461,11 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
         /* Pre-fill DMA with silence */
         memset(play_buf, 0, PLAY_CHUNK);
         for (int k = 0; k < 4; k++) {
-            size_t w;
-            i2s_speaker_write(tx_handle, play_buf, PLAY_CHUNK, &w, 100);
+            ret = i2s_write_all(tx_handle, play_buf, PLAY_CHUNK, 100);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to prefill I2S DMA: %s", esp_err_to_name(ret));
+                goto done;
+            }
         }
 
         /* Wait for ring buffer to reach pre-fill threshold */
@@ -334,8 +482,11 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
             size_t got = xStreamBufferReceive(sbuf, play_buf, PLAY_CHUNK,
                                               pdMS_TO_TICKS(100));
             if (got > 0) {
-                size_t w;
-                i2s_speaker_write(tx_handle, play_buf, got, &w, 1000);
+                ret = i2s_write_all(tx_handle, play_buf, got, 1000);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(ret));
+                    goto done;
+                }
             }
         }
 
@@ -348,8 +499,11 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
         /* Flush silence */
         memset(play_buf, 0, PLAY_CHUNK);
         for (int i = 0; i < 8; i++) {
-            size_t w;
-            i2s_speaker_write(tx_handle, play_buf, PLAY_CHUNK, &w, 1000);
+            ret = i2s_write_all(tx_handle, play_buf, PLAY_CHUNK, 1000);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to flush trailing silence: %s", esp_err_to_name(ret));
+                break;
+            }
         }
 
         ret = (total_pcm > 0) ? ESP_OK : ESP_FAIL;
@@ -361,6 +515,7 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
 
 done:
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    free(normalized);
     free(body);
     if (sbuf) vStreamBufferDelete(sbuf);
     if (client) {
