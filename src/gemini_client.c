@@ -25,11 +25,16 @@ static const char *PROMPT_TEMPLATE =
     "Поточний час: %s. Місто: %s, %s. "
     "Погода зараз: %s. "
     "Не вигадуй факти. "
+    "На прості фактичні питання відповідай коротко. "
+    "На складні, відкриті або прогностичні питання відповідай розгорнуто: "
+    "поясни контекст, невизначеність і кілька ключових факторів. "
+    "Відповідай ЗВИЧАЙНИМ ТЕКСТОМ без Markdown, без символів *, **, _, #, `, "
+    "без списків з маркерами і без будь-якого форматування. "
     "ВАЖЛИВО: Всі числа пиши СЛОВАМИ з правильними відмінками "
     "(наприклад: 'двадцять один градус', 'п'ять градусів', "
     "'о сьомій тридцять', 'дванадцята година'). "
-    "Став наголоси (символ \\u0301) на словах де наголос може бути неочевидним "
-    "(Бе\\u0301регове, за\\u0301раз, а НЕ Берегове\\u0301 чи зара\\u0301з). "
+    "Не розставляй наголоси в словах символом \\u0301, якщо це не було явно потрібно. "
+    "Не додавай штучні наголоси для стилю відповіді. "
     "Формат:\\nQ: <транскрипція>\\nA: <повна відповідь українською>";
 
 /* city/country/weather from main.c */
@@ -95,12 +100,39 @@ static bool gemini_status_is_retryable(int status)
     return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
 }
 
+static esp_err_t append_text_part(char *dst, size_t dst_sz, size_t *dst_len,
+                                  const char *text, bool prepend_newline)
+{
+    size_t text_len;
+
+    if (!text || !text[0]) {
+        return ESP_OK;
+    }
+
+    text_len = strlen(text);
+    if (*dst_len + text_len + 2 > dst_sz) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (prepend_newline && *dst_len > 0) {
+        dst[(*dst_len)++] = '\n';
+    }
+
+    memcpy(dst + *dst_len, text, text_len);
+    *dst_len += text_len;
+    dst[*dst_len] = '\0';
+    return ESP_OK;
+}
+
 static esp_err_t gemini_ask_once(const int16_t *pcm_data, size_t num_samples,
                                  char *response_text, size_t max_response_len)
 {
     esp_err_t ret = ESP_FAIL;
     esp_http_client_handle_t client = NULL;
     char *resp_buf = NULL;
+    int resp_cap = 0;
+
+    response_text[0] = '\0';
 
     uint32_t pcm_bytes = num_samples * 2;
     uint32_t wav_total = 44 + pcm_bytes;
@@ -123,12 +155,12 @@ static esp_err_t gemini_ask_once(const int16_t *pcm_data, size_t num_samples,
         localtime_r(&now, &ti);
         strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M, %A", &ti);
     }
-    char prompt[1280];
+    char prompt[2304];
     snprintf(prompt, sizeof(prompt), PROMPT_TEMPLATE,
              time_str, g_city, g_country,
              g_weather[0] ? g_weather : "невідомо");
 
-    char json_suf[1536];
+    char json_suf[2560];
     snprintf(json_suf, sizeof(json_suf),
              "\"}},{\"text\":\"%s\"}]}],"
              "\"generationConfig\":{\"maxOutputTokens\":8192,"
@@ -211,14 +243,28 @@ static esp_err_t gemini_ask_once(const int16_t *pcm_data, size_t num_samples,
         int status  = esp_http_client_get_status_code(client);
         ESP_LOGI(TAG, "HTTP %d  content-length: %d", status, hdr_len);
 
-        int buf_sz = 8192;
-        resp_buf = malloc(buf_sz);
+        resp_cap = (hdr_len > 0) ? (hdr_len + 1) : 8192;
+        if (resp_cap < 8192) resp_cap = 8192;
+
+        resp_buf = malloc(resp_cap);
         if (!resp_buf) { ret = ESP_ERR_NO_MEM; goto done; }
 
         int total_rd = 0;
-        while (total_rd < buf_sz - 1) {
+        while (1) {
+            if (total_rd >= resp_cap - 1) {
+                int new_cap = resp_cap * 2;
+                char *new_buf = realloc(resp_buf, new_cap);
+                if (!new_buf) {
+                    ESP_LOGE(TAG, "Failed to grow response buffer past %d bytes", resp_cap);
+                    ret = ESP_ERR_NO_MEM;
+                    goto done;
+                }
+                resp_buf = new_buf;
+                resp_cap = new_cap;
+            }
+
             int rd = esp_http_client_read(client, resp_buf + total_rd,
-                                          buf_sz - total_rd - 1);
+                                          resp_cap - total_rd - 1);
             if (rd > 0) {
                 total_rd += rd;
             } else if (rd == 0) {
@@ -236,7 +282,7 @@ static esp_err_t gemini_ask_once(const int16_t *pcm_data, size_t num_samples,
             goto done;
         }
 
-        /* ---- 5) Parse JSON — find the last "text" part (skip thinking) ---- */
+        /* ---- 5) Parse JSON — collect all text parts into one answer ---- */
         cJSON *root = cJSON_Parse(resp_buf);
         if (!root) {
             ESP_LOGE(TAG, "JSON parse failed. First 200 chars: %.200s", resp_buf);
@@ -248,21 +294,27 @@ static esp_err_t gemini_ask_once(const int16_t *pcm_data, size_t num_samples,
         cJSON *cont  = c0   ? cJSON_GetObjectItem(c0,   "content") : NULL;
         cJSON *parts = cont ? cJSON_GetObjectItem(cont,  "parts")  : NULL;
 
-        /* Iterate parts in reverse — last text part is the actual answer */
-        const char *found_text = NULL;
+        size_t response_len = 0;
+        bool have_text = false;
         int n_parts = cJSON_GetArraySize(parts);
-        for (int i = n_parts - 1; i >= 0; i--) {
+        for (int i = 0; i < n_parts; i++) {
             cJSON *p = cJSON_GetArrayItem(parts, i);
             cJSON *t = p ? cJSON_GetObjectItem(p, "text") : NULL;
             if (t && cJSON_IsString(t) && t->valuestring && t->valuestring[0]) {
-                found_text = t->valuestring;
-                break;
+                esp_err_t append_err = append_text_part(response_text,
+                                                       max_response_len,
+                                                       &response_len,
+                                                       t->valuestring,
+                                                       have_text);
+                if (append_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Response truncated to %u bytes", (unsigned)(max_response_len - 1));
+                    break;
+                }
+                have_text = true;
             }
         }
 
-        if (found_text) {
-            strncpy(response_text, found_text, max_response_len - 1);
-            response_text[max_response_len - 1] = '\0';
+        if (have_text) {
             ESP_LOGI(TAG, "Response (%d parts): %s", n_parts, response_text);
             ret = ESP_OK;
         } else {

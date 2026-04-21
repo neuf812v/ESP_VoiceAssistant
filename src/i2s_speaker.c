@@ -7,8 +7,8 @@ esp_err_t i2s_speaker_init_rate(i2s_chan_handle_t *tx_handle, uint32_t sample_ra
 {
     // Channel config — use I2S_NUM_1 for speaker
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = 480;
+    chan_cfg.dma_desc_num = 10;
+    chan_cfg.dma_frame_num = 720;
 
     esp_err_t ret = i2s_new_channel(&chan_cfg, tx_handle, NULL);
     if (ret != ESP_OK) {

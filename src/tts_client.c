@@ -18,7 +18,6 @@ static const char *TAG = "tts";
 
 /* ---------- Configuration ---------- */
 #define TTS_URL       "https://texttospeech.googleapis.com/v1/text:synthesize?key="
-#define TTS_VOICE     "uk-UA-Wavenet-A"
 #define TTS_LANG      "uk-UA"
 #define TTS_RATE      24000
 
@@ -27,9 +26,9 @@ static const char *TAG = "tts";
 #define PCM_BUF_SZ    (B64_BUF_SZ * 3 / 4)   /* 768 bytes = 384 samples */
 #define FADE_SAMPLES  1200          /* 50 ms at 24 kHz */
 #define TTS_VOLUME    75            /* percent of full volume (reduces brownout) */
-#define RING_SZ       (12 * 1024)   /* ~250 ms ring buffer at 24 kHz 16-bit */
-#define PREFILL_SZ    (6 * 1024)    /* start playback after ~125 ms buffered */
-#define PLAY_CHUNK    768           /* consumer I2S write chunk */
+#define RING_SZ       (20 * 1024)   /* ~425 ms ring buffer at 24 kHz 16-bit */
+#define PREFILL_SZ    (10 * 1024)   /* start playback after ~210 ms buffered */
+#define PLAY_CHUNK    1536          /* consumer I2S write chunk */
 #define PRODUCER_STACK 6144
 #define WAV_HEADER_SZ 44            /* WAV header to skip for LINEAR16 */
 
@@ -39,9 +38,113 @@ typedef struct {
 } stress_fix_t;
 
 static const stress_fix_t STRESS_FIXES[] = {
+    {"не можу передбачити дату закінчення війни в Україні",
+     "не мо\xCC\x81жу передба\xCC\x81чити да\xCC\x81ту закі\xCC\x81нчення війни\xCC\x81 в Украї\xCC\x81ні"},
+    {"Не можу передбачити дату закінчення війни в Україні",
+     "Не мо\xCC\x81жу передба\xCC\x81чити да\xCC\x81ту закі\xCC\x81нчення війни\xCC\x81 в Украї\xCC\x81ні"},
+    {"ніхто не знає точної дати",
+     "ніхто\xCC\x81 не зна\xCC\x81є то\xCC\x81чної да\xCC\x81ти"},
+    {"Ніхто не знає точної дати",
+     "Ніхто\xCC\x81 не зна\xCC\x81є то\xCC\x81чної да\xCC\x81ти"},
     {"зараз", "за\xCC\x81раз"},
     {"Зараз", "За\xCC\x81раз"},
+    {"можу", "мо\xCC\x81жу"},
+    {"Можу", "Мо\xCC\x81жу"},
+    {"передбачити", "передба\xCC\x81чити"},
+    {"Передбачити", "Передба\xCC\x81чити"},
+    {"передбачає", "передбача\xCC\x81є"},
+    {"Передбачає", "Передбача\xCC\x81є"},
+    {"передбачав", "передбача\xCC\x81в"},
+    {"Передбачав", "Передбача\xCC\x81в"},
+    {"закінчення", "закі\xCC\x81нчення"},
+    {"Закінчення", "Закі\xCC\x81нчення"},
+    {"війни", "війни\xCC\x81"},
+    {"Війни", "Війни\xCC\x81"},
+    {"дати", "да\xCC\x81ти"},
+    {"Дати", "Да\xCC\x81ти"},
+    {"точної", "то\xCC\x81чної"},
+    {"Точної", "То\xCC\x81чної"},
+    {"знає", "зна\xCC\x81є"},
+    {"Знає", "Зна\xCC\x81є"},
+    {"Україні", "Украї\xCC\x81ні"},
+    {"Україна", "Украї\xCC\x81на"},
 };
+
+static char *sanitize_tts_text(const char *text)
+{
+    size_t src_len = strlen(text);
+    char *out = malloc(src_len + 1);
+    if (!out) {
+        return NULL;
+    }
+
+    size_t j = 0;
+    bool line_start = true;
+    for (size_t i = 0; i < src_len; i++) {
+        char ch = text[i];
+
+        if (ch == '\r') {
+            continue;
+        }
+
+        if ((unsigned char)ch == 0xCC && i + 1 < src_len &&
+            (unsigned char)text[i + 1] == 0x81) {
+            i++;
+            continue;
+        }
+
+        if (line_start) {
+            while (i < src_len && (text[i] == ' ' || text[i] == '\t')) {
+                i++;
+            }
+            if (i >= src_len) {
+                break;
+            }
+
+            if (text[i] == '*' || text[i] == '-' || text[i] == '#' || text[i] == '>') {
+                while (i < src_len && (text[i] == '*' || text[i] == '-' || text[i] == '#' ||
+                                       text[i] == '>' || text[i] == ' ' || text[i] == '\t')) {
+                    i++;
+                }
+                if (i >= src_len) {
+                    break;
+                }
+            }
+        }
+
+        ch = text[i];
+        if (ch == '*' || ch == '_' || ch == '`') {
+            continue;
+        }
+
+        if (ch == '\n') {
+            if (j > 0 && out[j - 1] == ' ') {
+                j--;
+            }
+            out[j++] = '\n';
+            line_start = true;
+            continue;
+        }
+
+        if (ch == ' ' || ch == '\t') {
+            if (j > 0 && (out[j - 1] == ' ' || out[j - 1] == '\n')) {
+                continue;
+            }
+            out[j++] = ' ';
+            line_start = false;
+            continue;
+        }
+
+        out[j++] = ch;
+        line_start = false;
+    }
+
+    while (j > 0 && (out[j - 1] == ' ' || out[j - 1] == '\n')) {
+        j--;
+    }
+    out[j] = '\0';
+    return out;
+}
 
 static bool is_word_boundary_byte(char ch)
 {
@@ -54,43 +157,113 @@ static bool is_word_boundary_byte(char ch)
     return uch < 0x80 && !isalnum(uch) && ch != '_';
 }
 
-static size_t count_stress_fix_matches(const char *text, const char *from)
+static bool ssml_reserve(char **buf, size_t *cap, size_t needed)
 {
-    size_t matches = 0;
-    size_t from_len = strlen(from);
-    const char *p = text;
-
-    while ((p = strstr(p, from)) != NULL) {
-        char prev = (p == text) ? '\0' : p[-1];
-        char next = p[from_len];
-
-        if (is_word_boundary_byte(prev) && is_word_boundary_byte(next)) {
-            matches++;
-        }
-        p += from_len;
+    if (needed + 1 <= *cap) {
+        return true;
     }
 
-    return matches;
+    size_t new_cap = *cap;
+    while (needed + 1 > new_cap) {
+        new_cap *= 2;
+    }
+
+    char *new_buf = realloc(*buf, new_cap);
+    if (!new_buf) {
+        return false;
+    }
+
+    *buf = new_buf;
+    *cap = new_cap;
+    return true;
 }
 
-static char *apply_stress_fixes(const char *text)
+static bool ssml_append_literal(char **buf, size_t *cap, size_t *len, const char *text)
 {
-    size_t out_len = strlen(text);
+    size_t text_len = strlen(text);
+    if (!ssml_reserve(buf, cap, *len + text_len)) {
+        return false;
+    }
 
-    for (size_t i = 0; i < sizeof(STRESS_FIXES) / sizeof(STRESS_FIXES[0]); i++) {
-        size_t count = count_stress_fix_matches(text, STRESS_FIXES[i].from);
-        if (count > 0) {
-            out_len += count * (strlen(STRESS_FIXES[i].to) - strlen(STRESS_FIXES[i].from));
+    memcpy(*buf + *len, text, text_len);
+    *len += text_len;
+    (*buf)[*len] = '\0';
+    return true;
+}
+
+static bool ssml_append_xml_escaped(char **buf, size_t *cap, size_t *len, const char *text)
+{
+    for (size_t i = 0; text[i]; i++) {
+        const char *replacement = NULL;
+        char ch = text[i];
+
+        switch (ch) {
+        case '&':
+            replacement = "&amp;";
+            break;
+        case '<':
+            replacement = "&lt;";
+            break;
+        case '>':
+            replacement = "&gt;";
+            break;
+        case '"':
+            replacement = "&quot;";
+            break;
+        case '\'':
+            replacement = "&apos;";
+            break;
+        default:
+            break;
+        }
+
+        if (replacement) {
+            if (!ssml_append_literal(buf, cap, len, replacement)) {
+                return false;
+            }
+        } else {
+            if (!ssml_reserve(buf, cap, *len + 1)) {
+                return false;
+            }
+            (*buf)[(*len)++] = ch;
+            (*buf)[*len] = '\0';
         }
     }
 
-    char *out = malloc(out_len + 1);
+    return true;
+}
+
+static bool ssml_append_punctuation_break(char **buf, size_t *cap, size_t *len,
+                                          char ch)
+{
+    switch (ch) {
+    case ',':
+        return ssml_append_literal(buf, cap, len, "<break time=\"180ms\"/>");
+    case ';':
+        return ssml_append_literal(buf, cap, len, "<break time=\"240ms\"/>");
+    case ':':
+        return ssml_append_literal(buf, cap, len, "<break time=\"260ms\"/>");
+    default:
+        return true;
+    }
+}
+
+static char *build_tts_ssml(const char *text)
+{
+    size_t cap = strlen(text) * 8 + 256;
+    size_t len = 0;
+    char *out = malloc(cap);
     if (!out) {
         return NULL;
     }
 
+    out[0] = '\0';
+    if (!ssml_append_literal(&out, &cap, &len, "<speak>")) {
+        free(out);
+        return NULL;
+    }
+
     const char *src = text;
-    char *dst = out;
     while (*src) {
         bool replaced = false;
 
@@ -104,9 +277,26 @@ static char *apply_stress_fixes(const char *text)
                 char next = src[from_len];
 
                 if (is_word_boundary_byte(prev) && is_word_boundary_byte(next)) {
-                    size_t to_len = strlen(to);
-                    memcpy(dst, to, to_len);
-                    dst += to_len;
+                    if (!ssml_append_literal(&out, &cap, &len, "<sub alias=\"")) {
+                        free(out);
+                        return NULL;
+                    }
+                    if (!ssml_append_xml_escaped(&out, &cap, &len, to)) {
+                        free(out);
+                        return NULL;
+                    }
+                    if (!ssml_append_literal(&out, &cap, &len, "\">")) {
+                        free(out);
+                        return NULL;
+                    }
+                    if (!ssml_append_xml_escaped(&out, &cap, &len, from)) {
+                        free(out);
+                        return NULL;
+                    }
+                    if (!ssml_append_literal(&out, &cap, &len, "</sub>")) {
+                        free(out);
+                        return NULL;
+                    }
                     src += from_len;
                     replaced = true;
                     break;
@@ -115,11 +305,24 @@ static char *apply_stress_fixes(const char *text)
         }
 
         if (!replaced) {
-            *dst++ = *src++;
+            char ch = *src++;
+            char tmp[2] = { ch, '\0' };
+            if (!ssml_append_xml_escaped(&out, &cap, &len, tmp)) {
+                free(out);
+                return NULL;
+            }
+            if (!ssml_append_punctuation_break(&out, &cap, &len, ch)) {
+                free(out);
+                return NULL;
+            }
         }
     }
 
-    *dst = '\0';
+    if (!ssml_append_literal(&out, &cap, &len, "</speak>")) {
+        free(out);
+        return NULL;
+    }
+
     return out;
 }
 
@@ -156,6 +359,9 @@ typedef struct {
     volatile size_t          total_pcm;
     int64_t                  t_start;
 } producer_ctx_t;
+
+static StaticStreamBuffer_t s_tts_ring_struct;
+static uint8_t s_tts_ring_storage[RING_SZ];
 
 static bool stream_buffer_send_all(StreamBufferHandle_t sbuf, const uint8_t *data,
                                    size_t len, TickType_t chunk_timeout)
@@ -351,10 +557,11 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
     esp_err_t ret = ESP_FAIL;
     esp_http_client_handle_t client = NULL;
     char *body = NULL;
-    char *normalized = NULL;
+    char *sanitized = NULL;
+    char *ssml = NULL;
     StreamBufferHandle_t sbuf = NULL;
 
-    ESP_LOGI(TAG, "TTS: \"%s\"", text);
+    ESP_LOGI(TAG, "TTS source: \"%s\"", text);
 
     int64_t t_start = esp_timer_get_time();
 
@@ -363,24 +570,35 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
     snprintf(url, sizeof(url), "%s%s", TTS_URL, CONFIG_CLOUD_TTS_API_KEY);
 
     /* ---- Build JSON body ---- */
-    normalized = apply_stress_fixes(text);
-    if (!normalized) { ret = ESP_ERR_NO_MEM; goto done; }
+    sanitized = sanitize_tts_text(text);
+    if (!sanitized) { ret = ESP_ERR_NO_MEM; goto done; }
 
-    size_t text_len = strlen(normalized);
+    if (strcmp(sanitized, text) != 0) {
+        ESP_LOGI(TAG, "TTS sanitized: \"%s\"", sanitized);
+    }
+
+    ssml = build_tts_ssml(sanitized);
+    if (!ssml) { ret = ESP_ERR_NO_MEM; goto done; }
+
+    if (strstr(ssml, "<sub alias=") != NULL) {
+        ESP_LOGI(TAG, "TTS SSML: %.300s", ssml);
+    }
+
+    size_t text_len = strlen(ssml);
     size_t body_sz = text_len * 2 + 512;
     body = malloc(body_sz);
     if (!body) { ret = ESP_ERR_NO_MEM; goto done; }
 
     char *escaped = malloc(text_len * 2 + 1);
     if (!escaped) { ret = ESP_ERR_NO_MEM; goto done; }
-    json_escape(normalized, escaped, text_len * 2 + 1);
+    json_escape(ssml, escaped, text_len * 2 + 1);
 
     int body_len = snprintf(body, body_sz,
-        "{\"input\":{\"text\":\"%s\"},"
+        "{\"input\":{\"ssml\":\"%s\"},"
         "\"voice\":{\"languageCode\":\"%s\",\"name\":\"%s\"},"
         "\"audioConfig\":{\"audioEncoding\":\"LINEAR16\","
         "\"sampleRateHertz\":%d}}",
-        escaped, TTS_LANG, TTS_VOICE, TTS_RATE);
+        escaped, TTS_LANG, CONFIG_CLOUD_TTS_VOICE, TTS_RATE);
     free(escaped);
     escaped = NULL;
 
@@ -418,6 +636,8 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
         ret = ESP_FAIL; goto done;
     }
     free(body); body = NULL;
+    free(ssml); ssml = NULL;
+    free(sanitized); sanitized = NULL;
 
     /* ---- Read response headers ---- */
     int64_t t_wait = esp_timer_get_time();
@@ -435,8 +655,14 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
     }
 
     /* ---- Ring buffer + producer/consumer ---- */
-    sbuf = xStreamBufferCreate(RING_SZ, 1);
-    if (!sbuf) { ret = ESP_ERR_NO_MEM; goto done; }
+    sbuf = xStreamBufferCreateStatic(RING_SZ, 1,
+                                     s_tts_ring_storage,
+                                     &s_tts_ring_struct);
+    if (!sbuf) {
+        ESP_LOGE(TAG, "Failed to initialize %u-byte static TTS ring buffer", (unsigned)RING_SZ);
+        ret = ESP_ERR_NO_MEM;
+        goto done;
+    }
 
     producer_ctx_t pctx = {
         .client    = client,
@@ -515,7 +741,8 @@ esp_err_t tts_speak(const char *text, i2s_chan_handle_t tx_handle)
 
 done:
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-    free(normalized);
+    free(sanitized);
+    free(ssml);
     free(body);
     if (sbuf) vStreamBufferDelete(sbuf);
     if (client) {

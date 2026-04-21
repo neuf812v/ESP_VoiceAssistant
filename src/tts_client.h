@@ -11,7 +11,7 @@ extern "C" {
 /**
  * Speak text via Google Cloud Text-to-Speech API.
  *
- * Sends text to Cloud TTS (uk-UA-Wavenet-A), receives LINEAR16 PCM 24 kHz,
+ * Sends text to Cloud TTS using the configured Ukrainian voice, receives LINEAR16 PCM 24 kHz,
  * streams directly to I2S speaker via ring buffer.
  *
  * The speaker must be initialised at 24 kHz before calling this function.

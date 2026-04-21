@@ -26,6 +26,13 @@ menu "Voice Assistant Configuration"
             default ""
             help
                 Google Cloud Text-to-Speech API key (from Cloud Console).
+
+        config CLOUD_TTS_VOICE
+            string "Google Cloud TTS Voice"
+            default "uk-UA-Chirp3-HD-Kore"
+            help
+                Google Cloud Text-to-Speech voice name, for example
+                uk-UA-Chirp3-HD-Kore, uk-UA-Wavenet-B, or uk-UA-Standard-B.
     endmenu
 
     choice TEST_MODE_SELECT

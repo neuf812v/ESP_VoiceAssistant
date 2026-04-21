@@ -50,6 +50,7 @@ static const char *TAG = "main";
 #define BUF_LEN       128   // samples per read/write cycle
 #define REC_SECONDS   3
 #define REC_SAMPLES   (SAMPLE_RATE * REC_SECONDS)  // 48000 samples
+#define RESPONSE_BUF_SZ  4096
 
 #define BTN_BOOT      GPIO_NUM_0    // BOOT button = PTT
 
@@ -58,6 +59,9 @@ char g_country[64] = "Україна";
 char g_weather[128] = "";  /* e.g. "18°C, хмарно" */
 static float g_lat = 50.45f;
 static float g_lon = 30.52f;
+
+static const char *GEMINI_BUSY_FALLBACK =
+    "Сервіс відповіді зараз перевантажений. Спробуйте ще раз за кілька секунд.";
 
 /* ---------- NTP time sync ---------- */
 static void ntp_sync(void)
@@ -209,6 +213,33 @@ static void btn_init(void)
 
 /* BOOT button: pressed = LOW (0), released = HIGH (1) */
 static inline bool btn_pressed(void) { return gpio_get_level(BTN_BOOT) == 0; }
+
+static void speak_text_reply(i2s_chan_handle_t rx_handle, const char *text)
+{
+    i2s_chan_handle_t tx_handle;
+    esp_err_t err;
+
+    ESP_LOGI(TAG, ">>> Speaking: %s <<<", text);
+
+    i2s_channel_disable(rx_handle);
+
+    err = i2s_speaker_init_rate(&tx_handle, 24000);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Speaker init failed");
+        i2s_channel_enable(rx_handle);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    err = tts_speak(text, tx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "TTS failed: %s", esp_err_to_name(err));
+    }
+
+    i2s_speaker_deinit(tx_handle);
+    i2s_channel_enable(rx_handle);
+}
 
 // GAIN is now computed automatically based on recorded signal level
 
@@ -464,7 +495,7 @@ static void gemini_test_task(void *arg)
              REC_SAMPLES * (int)sizeof(int16_t), REC_SECONDS);
 
     int32_t mic_buf[BUF_LEN];
-    char response[1024];
+    char response[RESPONSE_BUF_SZ];
 
     while (1) {
         ESP_LOGI(TAG, ">>> Press ENTER to record a question for Gemini <<<");
@@ -581,7 +612,7 @@ static void assistant_task(void *arg)
              REC_SAMPLES * (int)sizeof(int16_t), REC_SECONDS);
 
     int32_t mic_buf[BUF_LEN];
-    char response[1024];
+    char response[RESPONSE_BUF_SZ];
 
     while (1) {
         ESP_LOGI(TAG, ">>> Hold BOOT button to record <<<");
@@ -631,6 +662,9 @@ static void assistant_task(void *arg)
                                    response, sizeof(response));
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Gemini failed: %s", esp_err_to_name(err));
+            if (err == ESP_ERR_TIMEOUT) {
+                speak_text_reply(rx_handle, GEMINI_BUSY_FALLBACK);
+            }
             continue;
         }
         ESP_LOGI(TAG, "Gemini: %s", response);
@@ -653,28 +687,7 @@ static void assistant_task(void *arg)
         }
 
         /* --- TTS: text → speaker --- */
-        ESP_LOGI(TAG, ">>> Speaking: %s <<<", answer);
-
-        /* Disable mic I2S to reduce power draw during speaker + WiFi */
-        i2s_channel_disable(rx_handle);
-
-        i2s_chan_handle_t tx_handle;
-        err = i2s_speaker_init_rate(&tx_handle, 24000);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Speaker init failed");
-            i2s_channel_enable(rx_handle);
-            continue;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(50));  /* let power settle */
-
-        err = tts_speak(answer, tx_handle);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "TTS failed: %s", esp_err_to_name(err));
-        }
-
-        i2s_speaker_deinit(tx_handle);
-        i2s_channel_enable(rx_handle);  /* re-enable mic for next round */
+        speak_text_reply(rx_handle, answer);
     }
 
     free(rec_buf);
